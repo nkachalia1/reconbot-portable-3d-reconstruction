@@ -37,6 +37,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--wsl-distro",
         default=os.environ.get("RECONBOT_WSL_DISTRO", "Ubuntu-22.04"),
     )
+    parser.add_argument(
+        "--max-keyframes",
+        type=int,
+        default=int(os.environ.get("RECONBOT_MAX_KEYFRAMES", "120")),
+    )
+    parser.add_argument(
+        "--fallback-keyframes",
+        type=int,
+        default=int(os.environ.get("RECONBOT_FALLBACK_KEYFRAMES", "180")),
+    )
+    parser.add_argument(
+        "--no-wsl-staging",
+        action="store_true",
+        help="Run COLMAP directly on the mounted Windows project instead of WSL storage.",
+    )
     parser.add_argument("--keep-work", action="store_true")
     return parser
 
@@ -53,6 +68,9 @@ def create_app_from_args(args: argparse.Namespace):
             intrinsics=root / "configs" / "camera_intrinsics.yaml",
             wsl_distro=args.wsl_distro,
             openmvs_bin=args.openmvs_bin.resolve(),
+            max_frames=args.max_keyframes,
+            fallback_max_frames=args.fallback_keyframes,
+            use_wsl_staging=not args.no_wsl_staging,
             keep_work=args.keep_work,
         )
     )

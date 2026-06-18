@@ -207,3 +207,19 @@ After recording, click **Reconstruct video** in the Field tab. Progress is
 reported for quality gating, sparse SfM, dense MVS, meshing, texturing, and GLB
 publishing. Successful runs are added to the front-page history automatically;
 deleting a history entry removes both its saved video and model.
+
+### Accelerated Quality-Preserving Profile
+
+Field reconstruction uses an accelerated profile by default:
+
+- Selects up to 120 sharp, motion-distinct keyframes across the complete orbit.
+- Uses COLMAP sequential matching plus explicit end-to-start loop-closure pairs.
+- Stages COLMAP images and its SQLite database in WSL's native Linux filesystem.
+- Keeps OpenMVS at full dense resolution and uses all CPU threads at normal priority.
+- Retains failed-job depth maps and checkpoints so resubmitting the same video resumes.
+- Automatically retries with up to 180 keyframes and exhaustive matching when sparse
+  registration or landmark density misses the quality gate.
+
+This reduces redundant computation rather than lowering dense-image resolution or
+texture settings. Each reconstruction records the selected frame count, rejected
+blur/redundancy samples, matching strategy, fallback status, and WSL staging status.

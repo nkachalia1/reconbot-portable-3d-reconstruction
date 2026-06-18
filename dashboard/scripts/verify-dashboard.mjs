@@ -74,23 +74,29 @@ await page.screenshot({
   fullPage: true,
 });
 
-await page
-  .locator(".history-select")
-  .filter({ hasText: "Field Test 2 - Basket" })
-  .evaluate((element) => element.click());
-await page.getByText("Reconstruction ready").waitFor({ timeout: 60000 });
-await page.waitForTimeout(1200);
-await page.evaluate(() => window.scrollTo(0, 0));
-await page.screenshot({
-  path: path.join(outputDir, "dashboard-history-field-test.png"),
-  fullPage: true,
-});
+const catalog = await fetch("http://127.0.0.1:4173/api/reconstructions").then((response) =>
+  response.json(),
+);
+let active = catalog.items.find((item) => item.id === catalog.active_id) ?? catalog.items[0];
+if (catalog.items.length > 1) {
+  const alternate = catalog.items.find((item) => item.id !== active.id);
+  await page
+    .locator(".history-select")
+    .filter({ hasText: alternate.title })
+    .evaluate((element) => element.click());
+  active = alternate;
+  await page.getByText("Reconstruction ready").waitFor({ timeout: 60000 });
+  await page.waitForTimeout(1200);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({
+    path: path.join(outputDir, "dashboard-history-alternate.png"),
+    fullPage: true,
+  });
+}
 
 await page.getByRole("button", { name: "Evaluation" }).click();
-await page.getByRole("heading", { name: "Field Test 2 - Basket" }).waitFor();
-await page.getByText("-2.9 pp").waitFor();
-await page.getByText("0.30x").waitFor();
-await page.getByText("39.6%").waitFor();
+await page.getByRole("heading", { name: active.title }).waitFor();
+await page.getByText("Selected run outcome").waitFor();
 await page.screenshot({
   path: path.join(outputDir, "dashboard-evaluation.png"),
   fullPage: true,
@@ -98,34 +104,17 @@ await page.screenshot({
 
 await page.getByRole("button", { name: "System" }).click();
 await page.getByText("System execution trace").waitFor();
-await page.getByText("0:33 / 490 frames").waitFor();
-await page.getByText("103 accepted / 61 rejected").waitFor();
-await page.getByText("98 depth maps / 395.09K points").waitFor();
-await page.getByText("170.17K published faces").first().waitFor();
+await page.getByRole("heading", { name: active.title }).waitFor();
+await page.getByText(`${active.metrics.registered_images} cameras`, { exact: false }).waitFor();
 await page.screenshot({
   path: path.join(outputDir, "dashboard-system.png"),
   fullPage: true,
 });
 
 await page.getByRole("button", { name: "Reconstruction" }).click();
-await page
-  .locator(".history-select")
-  .filter({ hasText: "Tape Measure - Session 003" })
-  .evaluate((element) => element.click());
 await page.getByText("Reconstruction ready").waitFor();
-await page.getByRole("button", { name: "Evaluation" }).click();
-await page.getByRole("heading", { name: "Tape Measure - Session 003" }).waitFor();
-await page.getByText("+2.9 pp").waitFor();
-await page.getByText("3.33x").waitFor();
-await page.getByText("28.4%").waitFor();
-await page.getByRole("button", { name: "System" }).click();
-await page.getByText("1:29 / 2,675 frames").waitFor();
-await page.getByText("173 accepted / 6 rejected").waitFor();
-await page.getByText("173 depth maps / 4.06M points").waitFor();
-await page.getByText("1.2M full / 63,605 published faces").waitFor();
 
 await page.setViewportSize({ width: 390, height: 844 });
-await page.getByRole("button", { name: "Reconstruction" }).click();
 await page.getByText("Reconstruction ready").waitFor();
 await page.waitForTimeout(500);
 const overflow = await page.evaluate(

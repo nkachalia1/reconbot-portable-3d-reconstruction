@@ -162,6 +162,39 @@ laptop storage. Failed jobs retain the work directory and pipeline log for
 diagnosis. The older `scripts/fetch_field_video.py` command remains available
 as a manual recovery path.
 
+## Accelerated Reconstruction Profile
+
+The laptop worker defaults to a quality-preserving accelerated profile:
+
+```text
+full video
+  -> adaptive sharp/motion keyframes (target 120)
+  -> sequential COLMAP matching + targeted loop closure
+  -> sparse quality gate
+  -> full-resolution OpenMVS dense reconstruction
+```
+
+COLMAP work is staged under `~/.cache/reconbot/` inside WSL instead of operating
+its SQLite database and thousands of small files through `/mnt/c`. The staged
+workspace is copied back only when OpenMVS needs the undistorted images.
+
+If fewer than 92 percent of selected keyframes register, or the sparse model has
+fewer than 60 landmarks per registered image, the worker automatically retries
+with up to 180 keyframes and exhaustive matching. Dense resolution, mesh target,
+and texture settings are unchanged.
+
+If OpenMVS is interrupted, click **Reconstruct video** again for the same field
+session. The worker recognizes the identical MP4 and reuses its scene, completed
+depth maps, mesh, or texture checkpoint. Do not rename the session between retry
+attempts.
+
+Optional Windows environment overrides:
+
+```powershell
+$env:RECONBOT_MAX_KEYFRAMES = "120"
+$env:RECONBOT_FALLBACK_KEYFRAMES = "180"
+```
+
 ## Capture Rules
 
 - Move in a slow arc with 60 to 80 percent adjacent-frame overlap.

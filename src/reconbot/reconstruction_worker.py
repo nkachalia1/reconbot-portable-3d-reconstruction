@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ import time
 from typing import Callable
 from uuid import uuid4
 
-from .frame_extraction import extract_frames
+from .frame_extraction import extract_adaptive_keyframes
 from .io_utils import ensure_dir, load_intrinsics_yaml, write_json
 
 
@@ -69,6 +70,37 @@ def _parse_model_analyzer(output: str) -> dict[str, object]:
     return metrics
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_loop_pairs(
+    images: list[Path],
+    target: Path,
+    window: int = 15,
+) -> int:
+    """Write targeted end-to-start pairs that preserve a closed camera orbit."""
+    if len(images) < 4:
+        target.write_text("", encoding="utf-8")
+        return 0
+    edge = min(window, max(2, len(images) // 4))
+    pairs = {
+        (first.name, last.name)
+        for first in images[:edge]
+        for last in images[-edge:]
+        if first.name != last.name
+    }
+    target.write_text(
+        "".join(f"{first} {second}\n" for first, second in sorted(pairs)),
+        encoding="utf-8",
+    )
+    return len(pairs)
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     project_root: Path
@@ -80,9 +112,17 @@ class WorkerConfig:
     node_executable: str = "node"
     every_n: int = 3
     min_blur: float = 15.0
-    max_frames: int = 220
+    max_frames: int = 120
+    fallback_max_frames: int = 180
+    min_keyframe_motion_px: float = 5.0
+    max_keyframe_gap_s: float = 0.75
+    sequential_overlap: int = 15
+    loop_pair_window: int = 15
+    min_registration_ratio: float = 0.92
+    min_sparse_points_per_image: float = 60.0
     target_faces: int = 300_000
     keep_work: bool = False
+    use_wsl_staging: bool = True
 
 
 class ReconstructionCatalog:
@@ -299,6 +339,273 @@ class ReconstructionPipeline:
             log_path,
         )
 
+    def _run_wsl_shell(self, shell_command: str, log_path: Path) -> str:
+        return self._run(
+            [
+                "wsl.exe",
+                "-d",
+                self.config.wsl_distro,
+                "--",
+                "bash",
+                "-lc",
+                shell_command,
+            ],
+            log_path,
+        )
+
+    def _wsl_home(self) -> str:
+        completed = subprocess.run(
+            [
+                "wsl.exe",
+                "-d",
+                self.config.wsl_distro,
+                "--",
+                "bash",
+                "-lc",
+                'printf "%s" "$HOME"',
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return completed.stdout.strip()
+
+    def _prepare_colmap_workspace(
+        self,
+        identifier: str,
+        frame_dir: Path,
+        loop_pairs: Path,
+        local_colmap_dir: Path,
+        log_path: Path,
+    ) -> dict[str, str]:
+        if os.name != "nt" or not self.config.use_wsl_staging:
+            sparse_dir = ensure_dir(local_colmap_dir / "sparse")
+            return {
+                "root": str(local_colmap_dir),
+                "images": str(frame_dir),
+                "database": str(local_colmap_dir / "database.db"),
+                "sparse": str(sparse_dir),
+                "dense": str(local_colmap_dir / "dense"),
+                "loop_pairs": str(loop_pairs),
+                "staged": "0",
+            }
+
+        root = f"{self._wsl_home()}/.cache/reconbot/{identifier}"
+        source_frames = _windows_to_wsl(frame_dir)
+        source_pairs = _windows_to_wsl(loop_pairs)
+        self._run_wsl_shell(
+            " && ".join(
+                [
+                    f"rm -rf -- {shlex.quote(root)}",
+                    f"mkdir -p {shlex.quote(root + '/frames')} {shlex.quote(root + '/colmap/sparse')}",
+                    f"cp -a {shlex.quote(source_frames + '/.')} {shlex.quote(root + '/frames/')}",
+                    f"cp {shlex.quote(source_pairs)} {shlex.quote(root + '/loop_pairs.txt')}",
+                ]
+            ),
+            log_path,
+        )
+        return {
+            "root": root,
+            "images": f"{root}/frames",
+            "database": f"{root}/colmap/database.db",
+            "sparse": f"{root}/colmap/sparse",
+            "dense": f"{root}/colmap/dense",
+            "loop_pairs": f"{root}/loop_pairs.txt",
+            "staged": "1",
+        }
+
+    def _copy_staged_dense(
+        self,
+        workspace: dict[str, str],
+        local_dense_dir: Path,
+        log_path: Path,
+    ) -> None:
+        if workspace["staged"] == "0":
+            return
+        if local_dense_dir.exists():
+            shutil.rmtree(local_dense_dir)
+        ensure_dir(local_dense_dir.parent)
+        destination = _windows_to_wsl(local_dense_dir.parent)
+        self._run_wsl_shell(
+            f"cp -a {shlex.quote(workspace['dense'])} {shlex.quote(destination + '/')}",
+            log_path,
+        )
+
+    def _cleanup_staged_workspace(
+        self,
+        workspace: dict[str, str],
+        log_path: Path,
+    ) -> None:
+        if workspace["staged"] == "1":
+            self._run_wsl_shell(
+                f"rm -rf -- {shlex.quote(workspace['root'])}",
+                log_path,
+            )
+
+    def _run_sparse_attempt(
+        self,
+        identifier: str,
+        frame_dir: Path,
+        colmap_dir: Path,
+        matcher: str,
+        pipeline_log: Path,
+    ) -> dict[str, object]:
+        images = sorted(frame_dir.glob("*.jpg"))
+        loop_pairs = colmap_dir.parent / "loop_pairs.txt"
+        loop_pair_count = _write_loop_pairs(
+            images,
+            loop_pairs,
+            self.config.loop_pair_window,
+        )
+        if colmap_dir.exists():
+            shutil.rmtree(colmap_dir)
+        ensure_dir(colmap_dir)
+        workspace = self._prepare_colmap_workspace(
+            identifier,
+            frame_dir,
+            loop_pairs,
+            colmap_dir,
+            pipeline_log,
+        )
+        try:
+            feature_args = [
+                "feature_extractor",
+                "--database_path",
+                workspace["database"],
+                "--image_path",
+                workspace["images"],
+                "--ImageReader.camera_model",
+                "OPENCV",
+                "--ImageReader.single_camera",
+                "1",
+                "--SiftExtraction.use_gpu",
+                "0",
+            ]
+            if self.config.intrinsics.exists():
+                camera_matrix, distortion, _ = load_intrinsics_yaml(self.config.intrinsics)
+                distortion_values = distortion.reshape(-1).tolist()
+                while len(distortion_values) < 4:
+                    distortion_values.append(0.0)
+                values = [
+                    camera_matrix[0, 0],
+                    camera_matrix[1, 1],
+                    camera_matrix[0, 2],
+                    camera_matrix[1, 2],
+                    *distortion_values[:4],
+                ]
+                feature_args.extend(
+                    ["--ImageReader.camera_params", ",".join(str(value) for value in values)]
+                )
+            self._run_colmap(feature_args, pipeline_log)
+
+            if matcher == "sequential":
+                self._run_colmap(
+                    [
+                        "sequential_matcher",
+                        "--database_path",
+                        workspace["database"],
+                        "--SequentialMatching.overlap",
+                        str(self.config.sequential_overlap),
+                        "--SequentialMatching.quadratic_overlap",
+                        "1",
+                        "--SiftMatching.guided_matching",
+                        "1",
+                        "--SiftMatching.use_gpu",
+                        "0",
+                    ],
+                    pipeline_log,
+                )
+                if loop_pair_count:
+                    self._run_colmap(
+                        [
+                            "matches_importer",
+                            "--database_path",
+                            workspace["database"],
+                            "--match_list_path",
+                            workspace["loop_pairs"],
+                            "--match_type",
+                            "pairs",
+                            "--SiftMatching.guided_matching",
+                            "1",
+                            "--SiftMatching.use_gpu",
+                            "0",
+                        ],
+                        pipeline_log,
+                    )
+            else:
+                self._run_colmap(
+                    [
+                        "exhaustive_matcher",
+                        "--database_path",
+                        workspace["database"],
+                        "--SiftMatching.guided_matching",
+                        "1",
+                        "--SiftMatching.use_gpu",
+                        "0",
+                    ],
+                    pipeline_log,
+                )
+
+            self._run_colmap(
+                [
+                    "mapper",
+                    "--database_path",
+                    workspace["database"],
+                    "--image_path",
+                    workspace["images"],
+                    "--output_path",
+                    workspace["sparse"],
+                    "--Mapper.max_num_models",
+                    "1",
+                ],
+                pipeline_log,
+            )
+            model = f"{workspace['sparse']}/0"
+            analyzer = self._run_colmap(
+                ["model_analyzer", "--path", model],
+                pipeline_log,
+            )
+            metrics = _parse_model_analyzer(analyzer)
+            self._run_colmap(
+                [
+                    "image_undistorter",
+                    "--image_path",
+                    workspace["images"],
+                    "--input_path",
+                    model,
+                    "--output_path",
+                    workspace["dense"],
+                    "--output_type",
+                    "COLMAP",
+                ],
+                pipeline_log,
+            )
+            self._copy_staged_dense(
+                workspace,
+                colmap_dir / "dense",
+                pipeline_log,
+            )
+            metrics["matching_strategy"] = matcher
+            metrics["loop_pairs"] = loop_pair_count if matcher == "sequential" else 0
+            metrics["wsl_native_staging"] = workspace["staged"] == "1"
+            return metrics
+        finally:
+            self._cleanup_staged_workspace(workspace, pipeline_log)
+
+    @staticmethod
+    def _load_pipeline_state(path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    @staticmethod
+    def _save_pipeline_state(path: Path, state: dict[str, object]) -> None:
+        write_json(path, state)
+
     def __call__(
         self,
         identifier: str,
@@ -315,180 +622,229 @@ class ReconstructionPipeline:
         dense_dir = colmap_dir / "dense"
         openmvs_dir = ensure_dir(work / "openmvs")
         pipeline_log = record_dir / "pipeline.log"
+        state_path = work / "pipeline_state.json"
         started = time.perf_counter()
+        video_signature = _file_sha256(video_path)
+        profile = {
+            "every_n": int(parameters.get("every_n") or config.every_n),
+            "min_blur": float(parameters.get("min_blur") or config.min_blur),
+            "max_frames": int(parameters.get("max_frames") or config.max_frames),
+            "min_motion_px": float(
+                parameters.get("min_motion_px") or config.min_keyframe_motion_px
+            ),
+            "max_gap_s": float(
+                parameters.get("max_gap_s") or config.max_keyframe_gap_s
+            ),
+        }
+        state = self._load_pipeline_state(state_path)
+        if state.get("video_sha256") != video_signature or state.get("profile") != profile:
+            if work.exists():
+                shutil.rmtree(work)
+            work = ensure_dir(record_dir / "work")
+            frame_dir = work / "frames"
+            colmap_dir = work / "colmap"
+            dense_dir = colmap_dir / "dense"
+            openmvs_dir = ensure_dir(work / "openmvs")
+            state_path = work / "pipeline_state.json"
+            state = {
+                "video_sha256": video_signature,
+                "profile": profile,
+                "metrics": {},
+            }
+            self._save_pipeline_state(state_path, state)
 
-        progress("quality_gate", 8, "Extracting sharp, overlapping frames")
-        extraction = extract_frames(
-            video_path,
-            frame_dir,
-            every_n=int(parameters.get("every_n") or config.every_n),
-            min_blur=float(parameters.get("min_blur") or config.min_blur),
-            max_frames=int(parameters.get("max_frames") or config.max_frames),
-        )
-        if extraction.written_frames < 20:
-            raise RuntimeError(
-                f"Only {extraction.written_frames} sharp frames survived the quality gate; "
-                "record a slower orbit or lower the blur threshold."
+        metrics = dict(state.get("metrics") or {})
+        interface_ready = bool(state.get("interface_ready")) and (
+            openmvs_dir / "scene.mvs"
+        ).exists()
+        if not interface_ready:
+            progress("quality_gate", 8, "Selecting motion-distinct keyframes across the orbit")
+            extraction = extract_adaptive_keyframes(
+                video_path,
+                frame_dir,
+                every_n=profile["every_n"],
+                min_blur=profile["min_blur"],
+                max_frames=profile["max_frames"],
+                min_motion_px=profile["min_motion_px"],
+                max_gap_s=profile["max_gap_s"],
             )
+            if extraction.written_frames < 20:
+                raise RuntimeError(
+                    f"Only {extraction.written_frames} sharp keyframes survived the quality gate; "
+                    "record a slower orbit or lower the blur threshold."
+                )
 
-        ensure_dir(sparse_dir)
-        database = colmap_dir / "database.db"
-        feature_args = [
-            "feature_extractor",
-            "--database_path",
-            str(database),
-            "--image_path",
-            str(frame_dir),
-            "--ImageReader.camera_model",
-            "OPENCV",
-            "--ImageReader.single_camera",
-            "1",
-        ]
-        if config.intrinsics.exists():
-            camera_matrix, distortion, _ = load_intrinsics_yaml(config.intrinsics)
-            distortion_values = distortion.reshape(-1).tolist()
-            while len(distortion_values) < 4:
-                distortion_values.append(0.0)
-            values = [
-                camera_matrix[0, 0],
-                camera_matrix[1, 1],
-                camera_matrix[0, 2],
-                camera_matrix[1, 2],
-                *distortion_values[:4],
-            ]
-            feature_args.extend(
-                ["--ImageReader.camera_params", ",".join(str(value) for value in values)]
+            progress("sparse_sfm", 18, "Matching temporal neighbors and loop-closure views")
+            sparse_metrics = self._run_sparse_attempt(
+                identifier,
+                frame_dir,
+                colmap_dir,
+                "sequential",
+                pipeline_log,
             )
+            registered = int(sparse_metrics.get("registered_images") or 0)
+            registration_ratio = registered / max(extraction.written_frames, 1)
+            points_per_image = float(sparse_metrics.get("sparse_points") or 0) / max(
+                registered,
+                1,
+            )
+            fallback_needed = (
+                registration_ratio < config.min_registration_ratio
+                or points_per_image < config.min_sparse_points_per_image
+            )
+            if fallback_needed:
+                progress(
+                    "sparse_sfm",
+                    28,
+                    "Sparse quality gate requested a denser exhaustive fallback",
+                )
+                extraction = extract_adaptive_keyframes(
+                    video_path,
+                    frame_dir,
+                    every_n=profile["every_n"],
+                    min_blur=profile["min_blur"],
+                    max_frames=config.fallback_max_frames,
+                    min_motion_px=max(2.0, profile["min_motion_px"] * 0.5),
+                    max_gap_s=min(0.6, profile["max_gap_s"]),
+                )
+                sparse_metrics = self._run_sparse_attempt(
+                    identifier,
+                    frame_dir,
+                    colmap_dir,
+                    "exhaustive",
+                    pipeline_log,
+                )
+                sparse_metrics["quality_fallback"] = True
+            else:
+                sparse_metrics["quality_fallback"] = False
 
-        progress("sparse_sfm", 18, "Extracting and matching calibrated image features")
-        self._run_colmap(feature_args, pipeline_log)
-        self._run_colmap(
-            [
-                "exhaustive_matcher",
-                "--database_path",
-                str(database),
-                "--SiftMatching.guided_matching",
-                "1",
-            ],
-            pipeline_log,
-        )
-        progress("sparse_sfm", 32, "Recovering camera poses and sparse landmarks")
-        self._run_colmap(
-            [
-                "mapper",
-                "--database_path",
-                str(database),
-                "--image_path",
-                str(frame_dir),
-                "--output_path",
-                str(sparse_dir),
-            ],
-            pipeline_log,
-        )
-        model = sparse_dir / "0"
-        if not model.exists():
-            raise RuntimeError("COLMAP did not produce a connected sparse model")
-        analyzer = self._run_colmap(["model_analyzer", "--path", str(model)], pipeline_log)
-        metrics = _parse_model_analyzer(analyzer)
-        metrics["extracted_frames"] = extraction.written_frames
-        metrics["blur_rejected_samples"] = extraction.skipped_blurry_frames
-        metrics["sampled_frames"] = (
-            extraction.written_frames + extraction.skipped_blurry_frames
-        )
-        registered = int(metrics.get("registered_images") or 0)
-        metrics["registration_ratio"] = (
-            registered / extraction.written_frames if extraction.written_frames else 0.0
-        )
+            registered = int(sparse_metrics.get("registered_images") or 0)
+            sparse_metrics.update(
+                {
+                    "extracted_frames": extraction.written_frames,
+                    "blur_rejected_samples": extraction.skipped_blurry_frames,
+                    "redundant_rejected_samples": extraction.skipped_redundant_frames,
+                    "sampled_frames": extraction.sampled_frames,
+                    "median_keyframe_motion_px": extraction.median_motion_px,
+                    "median_keyframe_overlap_ratio": extraction.median_overlap_ratio,
+                    "registration_ratio": registered / max(extraction.written_frames, 1),
+                    "acceleration_profile": "adaptive_sequence_v1",
+                }
+            )
+            metrics.update(sparse_metrics)
+            progress("undistort", 43, "Preparing calibrated images for dense reconstruction")
+            self._run(
+                [
+                    self._openmvs_executable("InterfaceCOLMAP"),
+                    "-i",
+                    str(dense_dir),
+                    "-o",
+                    "scene.mvs",
+                    "--image-folder",
+                    str(dense_dir / "images"),
+                    "--process-priority",
+                    "0",
+                    "--max-threads",
+                    "0",
+                ],
+                pipeline_log,
+                openmvs_dir,
+            )
+            state.update({"interface_ready": True, "metrics": metrics})
+            self._save_pipeline_state(state_path, state)
 
-        progress("undistort", 43, "Preparing calibrated images for dense reconstruction")
-        self._run_colmap(
-            [
-                "image_undistorter",
-                "--image_path",
-                str(frame_dir),
-                "--input_path",
-                str(model),
-                "--output_path",
-                str(dense_dir),
-                "--output_type",
-                "COLMAP",
-            ],
-            pipeline_log,
-        )
-
-        progress("dense_mvs", 52, "Computing multi-view depth maps on the laptop")
-        self._run(
-            [
-                self._openmvs_executable("InterfaceCOLMAP"),
-                "-i",
-                str(dense_dir),
-                "-o",
-                "scene.mvs",
-                "--image-folder",
-                str(dense_dir / "images"),
-            ],
-            pipeline_log,
-            openmvs_dir,
-        )
-        self._run(
-            [self._openmvs_executable("DensifyPointCloud"), "scene.mvs"],
-            pipeline_log,
-            openmvs_dir,
-        )
+        progress("dense_mvs", 52, "Computing or resuming multi-view depth maps")
+        dense_ply = openmvs_dir / "scene_dense.ply"
+        if not dense_ply.exists():
+            self._run(
+                [
+                    self._openmvs_executable("DensifyPointCloud"),
+                    "scene.mvs",
+                    "--process-priority",
+                    "0",
+                    "--max-threads",
+                    "0",
+                ],
+                pipeline_log,
+                openmvs_dir,
+            )
         dense_ply = openmvs_dir / "scene_dense.ply"
         metrics["dense_points"] = _ply_counts(dense_ply)[0]
         metrics["dense_depth_maps"] = len(list(openmvs_dir.glob("depth*.dmap")))
+        state.update({"dense_ready": True, "metrics": metrics})
+        self._save_pipeline_state(state_path, state)
 
         progress("mesh", 78, "Reconstructing and simplifying the surface mesh")
         mesh_name = "scene_dense_mesh.ply"
-        self._run(
-            [
-                self._openmvs_executable("ReconstructMesh"),
-                "scene_dense.mvs",
-                "-p",
-                "scene_dense.ply",
-                "-o",
-                mesh_name,
-                "--target-face-num",
-                str(int(parameters.get("target_faces") or config.target_faces)),
-            ],
-            pipeline_log,
-            openmvs_dir,
-        )
         mesh_path = openmvs_dir / mesh_name
+        if not mesh_path.exists():
+            mesh_output = self._run(
+                [
+                    self._openmvs_executable("ReconstructMesh"),
+                    "scene_dense.mvs",
+                    "-p",
+                    "scene_dense.ply",
+                    "-o",
+                    mesh_name,
+                    "--target-face-num",
+                    str(int(parameters.get("target_faces") or config.target_faces)),
+                    "--process-priority",
+                    "0",
+                    "--max-threads",
+                    "0",
+                ],
+                pipeline_log,
+                openmvs_dir,
+            )
+            full_mesh = re.search(
+                r"Mesh reconstruction completed:\s+(\d+) vertices,\s+(\d+) faces",
+                mesh_output,
+            )
+            if full_mesh:
+                metrics["full_mesh_vertices"] = int(full_mesh.group(1))
+                metrics["full_mesh_faces"] = int(full_mesh.group(2))
         metrics["mesh_vertices"], metrics["mesh_faces"] = _ply_counts(mesh_path)
-        metrics["full_mesh_vertices"] = metrics["mesh_vertices"]
-        metrics["full_mesh_faces"] = metrics["mesh_faces"]
+        metrics.setdefault("full_mesh_vertices", metrics["mesh_vertices"])
+        metrics.setdefault("full_mesh_faces", metrics["mesh_faces"])
+        state.update({"mesh_ready": True, "metrics": metrics})
+        self._save_pipeline_state(state_path, state)
 
         progress("texture", 89, "Projecting source images onto the presentation mesh")
         textured_name = "scene_dense_texture.ply"
-        self._run(
-            [
-                self._openmvs_executable("TextureMesh"),
-                "scene_dense.mvs",
-                "-m",
-                mesh_name,
-                "-o",
-                textured_name,
-                "--resolution-level",
-                "1",
-                "--virtual-face-images",
-                "3",
-                "--patch-packing-heuristic",
-                "100",
-                "--max-texture-size",
-                "4096",
-                "--global-seam-leveling",
-                "0",
-                "--local-seam-leveling",
-                "0",
-            ],
-            pipeline_log,
-            openmvs_dir,
-        )
+        if not (openmvs_dir / textured_name).exists():
+            self._run(
+                [
+                    self._openmvs_executable("TextureMesh"),
+                    "scene_dense.mvs",
+                    "-m",
+                    mesh_name,
+                    "-o",
+                    textured_name,
+                    "--resolution-level",
+                    "1",
+                    "--virtual-face-images",
+                    "3",
+                    "--patch-packing-heuristic",
+                    "100",
+                    "--max-texture-size",
+                    "4096",
+                    "--global-seam-leveling",
+                    "0",
+                    "--local-seam-leveling",
+                    "0",
+                    "--process-priority",
+                    "0",
+                    "--max-threads",
+                    "0",
+                ],
+                pipeline_log,
+                openmvs_dir,
+            )
         texture_candidates = sorted(openmvs_dir.glob("scene_dense_texture*.png"))
         if not texture_candidates:
             raise RuntimeError("OpenMVS did not create a texture atlas")
+        state.update({"texture_ready": True, "metrics": metrics})
+        self._save_pipeline_state(state_path, state)
 
         progress("publish", 96, "Packaging the textured mesh for the dashboard")
         converter = config.project_root / "dashboard" / "scripts" / "convert-textured-ply.mjs"
@@ -565,12 +921,24 @@ class ReconstructionJobManager:
         identifier = _safe_identifier(session_id)
         target_dir = ensure_dir(self.root / identifier)
         video_path = target_dir / "video.mp4"
-        if video_path.exists():
+        incoming = target_dir / ".incoming-video.mp4"
+        with incoming.open("wb") as handle:
+            shutil.copyfileobj(source_stream, handle, length=1024 * 1024)
+        reusable_failure = (
+            video_path.exists()
+            and (target_dir / "work" / "pipeline_state.json").exists()
+            and not (target_dir / "model.glb").exists()
+            and _file_sha256(video_path) == _file_sha256(incoming)
+        )
+        if video_path.exists() and not reusable_failure:
             identifier = f"{identifier}_{datetime.now().strftime('%H%M%S')}"
             target_dir = ensure_dir(self.root / identifier)
             video_path = target_dir / "video.mp4"
-        with video_path.open("wb") as handle:
-            shutil.copyfileobj(source_stream, handle, length=1024 * 1024)
+            incoming.replace(video_path)
+        elif reusable_failure:
+            incoming.unlink(missing_ok=True)
+        else:
+            incoming.replace(video_path)
         job_id = uuid4().hex
         job = {
             "id": job_id,

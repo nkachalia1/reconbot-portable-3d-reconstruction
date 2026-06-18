@@ -41,6 +41,7 @@ type ReconstructionMetrics = {
   sampled_frames?: number;
   extracted_frames?: number;
   blur_rejected_samples?: number;
+  redundant_rejected_samples?: number;
   registered_images?: number;
   registration_ratio?: number;
   sparse_points?: number;
@@ -56,6 +57,9 @@ type ReconstructionMetrics = {
   processing_time_s?: number;
   metric_accuracy_percent?: number;
   reference_height_mm?: number;
+  matching_strategy?: string;
+  quality_fallback?: boolean;
+  wsl_native_staging?: boolean;
 };
 
 type ReconstructionRecord = {
@@ -736,6 +740,7 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
   if (!reconstruction) return null;
   const metrics = reconstruction.metrics;
   const rejected = metrics.blur_rejected_samples;
+  const redundant = metrics.redundant_rejected_samples;
   const fullFaces = metrics.full_mesh_faces;
   const publishedFaces = metrics.mesh_faces;
   const stages = [
@@ -752,12 +757,14 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
       name: "Quality gate",
       detail: `${metricValue(metrics.extracted_frames)} accepted${
         rejected == null ? "" : ` / ${metricValue(rejected)} rejected`
-      }`,
+      }${redundant == null ? "" : ` / ${metricValue(redundant)} redundant`}`,
       icon: ScanLine,
     },
     {
       name: "Sparse SfM",
-      detail: `${metricValue(metrics.registered_images)} cameras / ${metricValue(metrics.sparse_points)} points`,
+      detail: `${metricValue(metrics.registered_images)} cameras / ${metricValue(metrics.sparse_points)} points${
+        metrics.matching_strategy ? ` / ${metrics.matching_strategy}` : ""
+      }`,
       icon: Camera,
     },
     {

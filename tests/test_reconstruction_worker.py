@@ -7,6 +7,7 @@ import time
 
 from reconbot.reconstruction_worker import (
     ReconstructionCatalog,
+    ReconstructionJobManager,
     WorkerConfig,
     create_reconstruction_app,
 )
@@ -121,3 +122,36 @@ def test_worker_api_publishes_completed_job(tmp_path: Path):
     assert job["result"]["title"] == "New Run"
     assert client.get("/api/reconstructions/new_run/model.glb").data == b"generated-model"
     assert client.get("/api/reconstructions/new_run/video.mp4").data == b"recorded-video"
+
+
+def test_failed_job_with_same_video_reuses_checkpoint_directory(tmp_path: Path):
+    attempts = 0
+
+    def runner(identifier, video_path, parameters, progress):
+        nonlocal attempts
+        attempts += 1
+        checkpoint = video_path.parent / "work" / "pipeline_state.json"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text("{}", encoding="utf-8")
+        if attempts == 1:
+            raise RuntimeError("interrupted")
+        return {"id": identifier}
+
+    manager = ReconstructionJobManager(tmp_path, runner)
+    first = manager.submit("resume-me", io.BytesIO(b"same-video"), {})
+    for _ in range(50):
+        first_status = manager.get(first["id"])
+        if first_status["status"] == "failed":
+            break
+        time.sleep(0.01)
+
+    second = manager.submit("resume-me", io.BytesIO(b"same-video"), {})
+    for _ in range(50):
+        second_status = manager.get(second["id"])
+        if second_status["status"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert first["reconstruction_id"] == "resume-me"
+    assert second["reconstruction_id"] == "resume-me"
+    assert second_status["status"] == "complete"

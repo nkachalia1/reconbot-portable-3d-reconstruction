@@ -567,7 +567,9 @@ def create_coordinator_app(
             "height": metadata.get("height"),
             "every_n": 3,
             "min_blur": 15,
-            "max_frames": 220,
+            "max_frames": 120,
+            "min_motion_px": 5.0,
+            "max_gap_s": 0.75,
             "target_faces": 300000,
         }
         try:
