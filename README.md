@@ -8,7 +8,7 @@ A battery-powered Raspberry Pi 5 perception system that captures monocular image
 
 _Interactive textured reconstruction and quantitative dashboard shown at 2x speed._
 
-This project is intentionally framed as a robotics/computer vision system, not a one-off OpenCV demo. It connects calibration, feature tracking, pose estimation, mapping, deployment constraints, and evaluation.
+This project is intentionally framed as a robotics/computer vision system. It connects calibration, feature tracking, pose estimation, mapping, deployment constraints, and evaluation.
 
 ## Hardware
 
@@ -118,18 +118,6 @@ See [docs/colmap_pipeline.md](docs/colmap_pipeline.md) for the full laptop workf
 - Implemented calibration, feature benchmarking, epipolar pose estimation, triangulation, and point cloud quality metrics using Python, NumPy, OpenCV, and COLMAP.
 - Reconstructed indoor scenes from handheld monocular image sequences and evaluated results with reprojection error, geometric inlier ratio, point density, and coverage metrics.
 - Built a field-to-laptop workflow that separates lightweight robotic data collection from heavier offline reconstruction and visualization.
-
-## How To Use Codex On This Project
-
-Treat Codex like a junior robotics engineer. Give it scoped tickets with acceptance criteria:
-
-- "Add a calibration report plot showing per-image reprojection error."
-- "Implement image quality gating for blur and exposure before frames are admitted to a dataset."
-- "Add a COLMAP model parser that computes track length and reprojection error from sparse reconstructions."
-- "Build a Flask dashboard that shows live captures, feature overlap, and latest reconstruction metrics."
-- "Create tests for triangulation, projection, and pose composition."
-
-The project becomes interview-worthy when every module produces artifacts you can show: YAML intrinsics, CSV benchmarks, JSON metrics, PLY point clouds, screenshots, and a short engineering writeup.
 
 ## Reconstruction Dashboard
 
