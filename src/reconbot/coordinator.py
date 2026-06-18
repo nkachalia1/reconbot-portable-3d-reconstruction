@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import http.client
 import json
 from pathlib import Path
 import re
@@ -12,8 +13,8 @@ import shutil
 import threading
 import time
 from typing import Protocol
-from urllib.error import URLError
-from urllib.parse import quote
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .active_guidance import guidance_text
@@ -53,6 +54,39 @@ class CameraClient(Protocol):
 
     def download_video(self, filename: str, target: Path) -> None:
         """Download a completed recording to target."""
+
+
+class ReconstructionClient(Protocol):
+    def health(self) -> dict[str, object]:
+        """Return reconstruction worker health."""
+
+    def list_reconstructions(self) -> dict[str, object]:
+        """Return the reconstruction library."""
+
+    def submit(
+        self,
+        session_id: str,
+        video_path: Path,
+        parameters: dict[str, object],
+    ) -> dict[str, object]:
+        """Submit a field video for reconstruction."""
+
+    def job(self, job_id: str) -> dict[str, object]:
+        """Return one reconstruction job."""
+
+    def activate(self, identifier: str) -> dict[str, object]:
+        """Make a reconstruction active."""
+
+    def delete(self, identifier: str) -> dict[str, object]:
+        """Delete a reconstruction and its saved video."""
+
+    def asset(
+        self,
+        identifier: str,
+        filename: str,
+        range_header: str | None = None,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        """Download or range-read a reconstruction asset."""
 
 
 class HttpCameraClient:
@@ -116,6 +150,109 @@ class HttpCameraClient:
             shutil.copyfileobj(response, handle)
 
 
+class HttpReconstructionClient:
+    def __init__(self, base_url: str, timeout_s: float = 30.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_s = timeout_s
+
+    def _json(
+        self,
+        path: str,
+        method: str = "GET",
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        headers = {"Accept": "application/json"}
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        request = Request(self.base_url + path, method=method, headers=headers, data=data)
+        with urlopen(request, timeout=self.timeout_s) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def health(self) -> dict[str, object]:
+        return self._json("/api/health")
+
+    def list_reconstructions(self) -> dict[str, object]:
+        return self._json("/api/reconstructions")
+
+    def submit(
+        self,
+        session_id: str,
+        video_path: Path,
+        parameters: dict[str, object],
+    ) -> dict[str, object]:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "video/mp4",
+            "Content-Length": str(video_path.stat().st_size),
+            "X-ReconBot-Session": session_id,
+            "X-ReconBot-Parameters": json.dumps(parameters, separators=(",", ":")),
+        }
+        parsed = urlsplit(self.base_url)
+        connection_type = (
+            http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        )
+        connection = connection_type(parsed.hostname, parsed.port, timeout=600.0)
+        path = (parsed.path.rstrip("/") or "") + "/api/jobs"
+        try:
+            connection.putrequest("POST", path)
+            for key, value in headers.items():
+                connection.putheader(key, value)
+            connection.endheaders()
+            with video_path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    connection.send(chunk)
+            response = connection.getresponse()
+            body = response.read()
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Reconstruction worker returned {response.status}: "
+                    f"{body.decode('utf-8', errors='replace')}"
+                )
+            return json.loads(body.decode("utf-8"))
+        finally:
+            connection.close()
+
+    def job(self, job_id: str) -> dict[str, object]:
+        return self._json("/api/jobs/" + quote(job_id))
+
+    def activate(self, identifier: str) -> dict[str, object]:
+        return self._json(
+            "/api/reconstructions/" + quote(identifier) + "/activate",
+            "POST",
+        )
+
+    def delete(self, identifier: str) -> dict[str, object]:
+        return self._json("/api/reconstructions/" + quote(identifier), "DELETE")
+
+    def asset(
+        self,
+        identifier: str,
+        filename: str,
+        range_header: str | None = None,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        headers = {}
+        if range_header:
+            headers["Range"] = range_header
+        request = Request(
+            self.base_url + f"/api/reconstructions/{quote(identifier)}/{filename}",
+            headers=headers,
+        )
+        try:
+            response = urlopen(request, timeout=300.0)
+        except HTTPError as exc:
+            response = exc
+        with response:
+            selected_headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower()
+                in {"content-type", "content-length", "content-range", "accept-ranges"}
+            }
+            return response.status, response.read(), selected_headers
+
+
 @dataclass
 class FieldSession:
     session_id: str
@@ -135,6 +272,7 @@ class FieldSession:
     video_started_at: float | None = None
     latest_video: str | None = None
     video_metadata: dict[str, object] | None = None
+    reconstruction_job_id: str | None = None
     stopped_at: str | None = None
     capture_events: list[dict[str, object]] = field(default_factory=list)
 
@@ -257,6 +395,14 @@ class SessionStore:
                 self.current.recording = False
                 self._persist_state()
 
+    def set_reconstruction_job(self, job_id: str) -> FieldSession:
+        with self._lock:
+            if self.current is None:
+                raise RuntimeError("No field session is active")
+            self.current.reconstruction_job_id = job_id
+            self._persist_state()
+            return self.current
+
     def _persist_state(self) -> None:
         if self.current is None:
             return
@@ -270,6 +416,7 @@ def create_coordinator_app(
     camera_client: CameraClient,
     session_root: str | Path,
     dashboard_dist: str | Path | None = None,
+    reconstruction_client: ReconstructionClient | None = None,
 ):
     try:
         from flask import Flask, Response, jsonify, request, send_file, send_from_directory
@@ -288,6 +435,15 @@ def create_coordinator_app(
         except (URLError, OSError, TimeoutError, ValueError) as exc:
             return {"connected": False, "error": str(exc)}
 
+    def reconstruction_health() -> dict[str, object]:
+        if reconstruction_client is None:
+            return {"connected": False, "error": "Reconstruction worker is not configured"}
+        try:
+            health = reconstruction_client.health()
+            return {"connected": bool(health.get("ok")), **health}
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return {"connected": False, "error": str(exc)}
+
     @app.get("/api/field/status")
     def status():
         return jsonify(
@@ -296,6 +452,7 @@ def create_coordinator_app(
                 "role": "pi-coordinator",
                 "uptime_s": time.time() - started_at,
                 "camera": camera_health(),
+                "reconstruction": reconstruction_health(),
                 "pi": collect_system_telemetry(session_root),
                 "session": asdict(store.current) if store.current else None,
             }
@@ -376,7 +533,7 @@ def create_coordinator_app(
         except RuntimeError as exc:
             store.abort_video()
             return jsonify({"error": str(exc)}), 409
-        except (URLError, OSError, TimeoutError, ValueError, KeyError) as exc:
+        except (URLError, OSError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
             store.abort_video()
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -390,6 +547,98 @@ def create_coordinator_app(
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
         return jsonify({"ok": True, "session": asdict(session)})
+
+    @app.post("/api/field/reconstruct")
+    def reconstruct_video():
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        if store.current is None or store.current.latest_video is None:
+            return jsonify({"error": "Stop and save a field recording first"}), 409
+        if store.current.recording:
+            return jsonify({"error": "Stop the active recording before reconstruction"}), 409
+        video_path = store.root / store.current.session_id / store.current.latest_video
+        metadata = dict(store.current.video_metadata or {})
+        parameters = {
+            "title": store.current.session_id.replace("_", " ").title(),
+            "duration_s": metadata.get("duration_s"),
+            "frames": metadata.get("frames"),
+            "fps": metadata.get("fps"),
+            "width": metadata.get("width"),
+            "height": metadata.get("height"),
+            "every_n": 3,
+            "min_blur": 15,
+            "max_frames": 220,
+            "target_faces": 300000,
+        }
+        try:
+            payload = reconstruction_client.submit(
+                store.current.session_id,
+                video_path,
+                parameters,
+            )
+            job = dict(payload.get("job") or {})
+            session = store.set_reconstruction_job(str(job["id"]))
+        except (URLError, OSError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
+            return jsonify({"error": f"Could not start reconstruction: {exc}"}), 503
+        return jsonify({"ok": True, "job": job, "session": asdict(session)}), 202
+
+    @app.get("/api/reconstruction/jobs/<job_id>")
+    def reconstruction_job(job_id: str):
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        try:
+            return jsonify(reconstruction_client.job(job_id))
+        except HTTPError as exc:
+            return jsonify({"error": exc.reason}), exc.code
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+
+    @app.get("/api/reconstructions")
+    def reconstruction_library():
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        try:
+            return jsonify(reconstruction_client.list_reconstructions())
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+
+    @app.post("/api/reconstructions/<identifier>/activate")
+    def activate_reconstruction(identifier: str):
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        try:
+            return jsonify(reconstruction_client.activate(identifier))
+        except HTTPError as exc:
+            return jsonify({"error": exc.reason}), exc.code
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+
+    @app.delete("/api/reconstructions/<identifier>")
+    def delete_reconstruction(identifier: str):
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        try:
+            return jsonify(reconstruction_client.delete(identifier))
+        except HTTPError as exc:
+            return jsonify({"error": exc.reason}), exc.code
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+
+    @app.get("/api/reconstructions/<identifier>/<asset>")
+    def reconstruction_asset(identifier: str, asset: str):
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        if asset not in {"model.glb", "video.mp4"}:
+            return jsonify({"error": "Asset not found"}), 404
+        try:
+            status_code, body, headers = reconstruction_client.asset(
+                identifier,
+                asset,
+                request.headers.get("Range"),
+            )
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+        return Response(body, status=status_code, headers=headers)
 
     @app.get("/api/field/latest.jpg")
     def latest_image():

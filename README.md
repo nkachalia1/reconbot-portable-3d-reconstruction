@@ -129,8 +129,12 @@ The project becomes interview-worthy when every module produces artifacts you ca
 
 The React/Three.js dashboard under `dashboard/` provides:
 
-- Interactive metric textured reconstruction with orbit, grid, wireframe, reset,
-  and fullscreen controls.
+- Interactive textured reconstructions with orbit, grid, wireframe, reset, and
+  fullscreen controls.
+- A persistent reconstruction history that swaps the active model, source
+  video, and quantitative metrics together.
+- Field recording controls that can submit the saved MP4 directly to the
+  laptop reconstruction worker.
 - Session 002 versus Session 003 quantitative evaluation.
 - End-to-end system execution trace and deployment constraints.
 - Embedded portfolio rotation clip.
@@ -159,11 +163,12 @@ pixel check.
 
 ## Two-Node Field System
 
-The deployed capture system uses the laptop webcam as a network sensor and the
-Raspberry Pi as the field coordinator:
+The deployed system uses the laptop webcam as a network sensor, the Raspberry
+Pi as the field coordinator, and a laptop worker for heavy reconstruction:
 
 ```text
-Laptop webcam/MP4 recorder (:5001) -> Raspberry Pi coordinator/dashboard (:5000)
+Laptop camera (:5001) ------> Raspberry Pi coordinator/dashboard (:5000)
+Laptop reconstruction (:5002) <- video + job requests -----------+
 ```
 
 Run the recorded-data simulation from Ubuntu/WSL:
@@ -180,11 +185,25 @@ simulation, but it does not normally expose the built-in laptop webcam. See
 [docs/hardware_runbook.md](docs/hardware_runbook.md) for the Windows
 environment, network, firewall, systemd, and field-capture instructions.
 
-After stopping a field recording, download it and launch sparse reconstruction
-from WSL:
+The native Windows laptop command starts both the camera service and the
+reconstruction worker. The worker drives COLMAP in WSL and the Windows OpenMVS
+CPU executables:
+
+```powershell
+$env:RECONBOT_TOKEN = "replace-with-a-long-random-token"
+$env:RECONBOT_OPENMVS_BIN = "$HOME\Downloads\OpenMVS_Windows_x64\vc17\x64\Release"
+.\.venv-win\Scripts\python scripts/laptop_camera_node.py
+```
+
+Configure the Pi with both laptop endpoints:
 
 ```bash
-python scripts/fetch_field_video.py \
-  --coordinator-url http://pi5.local:5000 \
-  --run-colmap
+export RECONBOT_CAMERA_URL=http://LAPTOP_IPV4:5001
+export RECONBOT_RECONSTRUCTION_URL=http://LAPTOP_IPV4:5002
+python scripts/pi_coordinator.py
 ```
+
+After recording, click **Reconstruct video** in the Field tab. Progress is
+reported for quality gating, sparse SfM, dense MVS, meshing, texturing, and GLB
+publishing. Successful runs are added to the front-page history automatically;
+deleting a history entry removes both its saved video and model.

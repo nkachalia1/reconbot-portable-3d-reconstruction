@@ -1,0 +1,45 @@
+{
+  "active_id": "tape-measure-session-003",
+  "items": [
+    {
+      "id": "tape-measure-session-003",
+      "title": "Tape Measure - Session 003",
+      "created_at": "2026-06-17T23:31:17-04:00",
+      "status": "complete",
+      "source": "portfolio",
+      "model_url": "/reconstructions/tape-measure-session-003/model.glb",
+      "video_url": "/reconstructions/tape-measure-session-003/video.mp4",
+      "metrics": {
+        "video_duration_s": 89.17,
+        "video_frames": 2675,
+        "sampled_frames": 179,
+        "extracted_frames": 173,
+        "blur_rejected_samples": 6,
+        "registered_images": 173,
+        "registration_ratio": 1,
+        "sparse_points": 31685,
+        "observations": 220309,
+        "mean_track_length": 6.95,
+        "mean_reprojection_error_px": 0.856,
+        "dense_depth_maps": 173,
+        "dense_points": 4060810,
+        "mesh_vertices": 32156,
+        "mesh_faces": 63605,
+        "full_mesh_vertices": 599305,
+        "full_mesh_faces": 1198446,
+        "metric_accuracy_percent": 0.13,
+        "reference_height_mm": 84.14
+      },
+      "viewer": {
+        "rotation_x": -1.5707963267948966,
+        "up_axis": "Z-up",
+        "scale_label": "100 mm",
+        "metric": true
+      },
+      "asset_files": {
+        "model": "model.glb",
+        "video": "video.mp4"
+      }
+    }
+  ]
+}

@@ -39,7 +39,13 @@ const sourceTexture = optionValue(
 );
 const outputDir = optionValue(
   "--out-dir",
-  path.join(root, "dashboard", "public", "assets"),
+  path.join(
+    root,
+    "dashboard",
+    "public",
+    "reconstructions",
+    "tape-measure-session-003",
+  ),
 );
 const outputGlb = optionValue(
   "--out-glb",

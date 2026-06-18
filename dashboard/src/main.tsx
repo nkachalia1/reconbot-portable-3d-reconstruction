@@ -9,9 +9,11 @@ import {
   Cpu,
   Database,
   Download,
+  Film,
   Focus,
   Gauge,
   Grid3X3,
+  LoaderCircle,
   Maximize2,
   Pause,
   Play,
@@ -22,6 +24,7 @@ import {
   Square,
   Thermometer,
   Triangle,
+  Trash2,
   Video,
   Wifi,
 } from "lucide-react";
@@ -31,6 +34,62 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import "./styles.css";
 
 type ViewName = "reconstruction" | "evaluation" | "system" | "field";
+
+type ReconstructionMetrics = {
+  video_duration_s?: number | null;
+  video_frames?: number | null;
+  sampled_frames?: number;
+  extracted_frames?: number;
+  blur_rejected_samples?: number;
+  registered_images?: number;
+  registration_ratio?: number;
+  sparse_points?: number;
+  observations?: number;
+  mean_track_length?: number;
+  mean_reprojection_error_px?: number;
+  dense_depth_maps?: number;
+  dense_points?: number;
+  mesh_vertices?: number;
+  mesh_faces?: number;
+  full_mesh_vertices?: number;
+  full_mesh_faces?: number;
+  processing_time_s?: number;
+  metric_accuracy_percent?: number;
+  reference_height_mm?: number;
+};
+
+type ReconstructionRecord = {
+  id: string;
+  title: string;
+  created_at: string;
+  status: "complete";
+  source: "field" | "portfolio";
+  model_url: string;
+  video_url?: string | null;
+  metrics: ReconstructionMetrics;
+  viewer?: {
+    rotation_x?: number;
+    up_axis?: string;
+    scale_label?: string;
+    metric?: boolean;
+  };
+};
+
+type ReconstructionCatalog = {
+  active_id: string | null;
+  items: ReconstructionRecord[];
+};
+
+type ReconstructionJob = {
+  id: string;
+  reconstruction_id: string;
+  status: "queued" | "running" | "complete" | "failed";
+  stage: string;
+  progress: number;
+  message: string;
+  error?: string | null;
+  result?: ReconstructionRecord | null;
+};
 
 type FieldStatus = {
   camera: {
@@ -45,6 +104,10 @@ type FieldStatus = {
       started_at?: number | null;
       duration_s?: number;
     };
+  };
+  reconstruction?: {
+    connected?: boolean;
+    error?: string;
   };
   pi: {
     temperature_c?: number | null;
@@ -79,6 +142,7 @@ type FieldStatus = {
     recording: boolean;
     video_started_at?: number | null;
     latest_video?: string | null;
+    reconstruction_job_id?: string | null;
     video_metadata?: {
       duration_s?: number;
       frames?: number;
@@ -90,38 +154,6 @@ type FieldStatus = {
   };
 };
 
-const sessions = {
-  baseline: {
-    label: "Session 002",
-    registered: 59,
-    extracted: 81,
-    sparsePoints: 4095,
-    observations: 24332,
-    reprojection: 1.414,
-    densePoints: 232999,
-    meshFaces: 114243,
-  },
-  refined: {
-    label: "Session 003",
-    registered: 173,
-    extracted: 173,
-    sparsePoints: 31685,
-    observations: 220309,
-    reprojection: 0.856,
-    densePoints: 4060810,
-    meshFaces: 1198446,
-  },
-};
-
-const stages = [
-  { name: "Capture", detail: "89.17 s / 2,675 frames", icon: Video },
-  { name: "Quality gate", detail: "173 accepted / 6 rejected", icon: ScanLine },
-  { name: "Sparse SfM", detail: "173 cameras / 31,685 points", icon: Camera },
-  { name: "Dense MVS", detail: "173 depth maps / 4.06 M points", icon: Database },
-  { name: "Mesh", detail: "1.20 M faces", icon: Triangle },
-  { name: "Metric export", detail: "84.14 mm reference / Z-up", icon: Gauge },
-];
-
 function formatCompact(value: number) {
   return new Intl.NumberFormat("en-US", {
     notation: value >= 100000 ? "compact" : "standard",
@@ -129,7 +161,7 @@ function formatCompact(value: number) {
   }).format(value);
 }
 
-function ModelViewer() {
+function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord }) {
   const mountRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef<{
     renderer?: THREE.WebGLRenderer;
@@ -143,7 +175,7 @@ function ModelViewer() {
   const [autoRotate, setAutoRotate] = useState(true);
   const [wireframe, setWireframe] = useState(false);
   const [grid, setGrid] = useState(true);
-  const [status, setStatus] = useState("Loading metric mesh");
+  const [status, setStatus] = useState("Loading reconstruction");
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -189,11 +221,12 @@ function ModelViewer() {
     scene.add(gridHelper);
 
     const loader = new GLTFLoader();
+    setStatus("Loading reconstruction");
     loader.load(
-      "/assets/reconstruction.glb?v=session-003-tape",
+      `${reconstruction.model_url}?v=${encodeURIComponent(reconstruction.id)}`,
       (gltf) => {
         const model = gltf.scene;
-        model.rotation.x = -Math.PI / 2;
+        model.rotation.x = reconstruction.viewer?.rotation_x ?? 0;
         model.traverse((child) => {
           if (child instanceof THREE.Mesh) {
             child.castShadow = true;
@@ -206,10 +239,17 @@ function ModelViewer() {
 
         const box = new THREE.Box3().setFromObject(model);
         const center = box.getCenter(new THREE.Vector3());
-        model.position.sub(center);
-        model.position.y += box.getSize(new THREE.Vector3()).y / 2;
-        controls.target.set(0, 0.035, 0);
-        setStatus("Metric model ready");
+        const size = box.getSize(new THREE.Vector3());
+        const largestDimension = Math.max(size.x, size.y, size.z) || 1;
+        const presentationScale = 0.62 / largestDimension;
+        model.scale.setScalar(presentationScale);
+        model.position.set(
+          -center.x * presentationScale,
+          -box.min.y * presentationScale,
+          -center.z * presentationScale,
+        );
+        controls.target.set(0, size.y * presentationScale * 0.36, 0);
+        setStatus("Reconstruction ready");
       },
       undefined,
       () => setStatus("Model unavailable"),
@@ -246,7 +286,7 @@ function ModelViewer() {
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, []);
+  }, [reconstruction.id, reconstruction.model_url, reconstruction.viewer?.rotation_x]);
 
   useEffect(() => {
     if (stateRef.current.controls) stateRef.current.controls.autoRotate = autoRotate;
@@ -311,10 +351,13 @@ function ModelViewer() {
       </div>
       <div className="viewer-canvas" ref={mountRef} />
       <div className="viewer-scale">
-        <span>100 mm</span>
+        <span>{reconstruction.viewer?.scale_label ?? "Auto-fit"}</span>
         <i />
       </div>
-      <div className="axis-badge">Z-up · meters</div>
+      <div className="axis-badge">
+        {reconstruction.viewer?.up_axis ?? "Y-up"} ·{" "}
+        {reconstruction.viewer?.metric ? "meters" : "SfM units"}
+      </div>
     </section>
   );
 }
@@ -334,16 +377,118 @@ function Metric({ label, value, detail, tone = "neutral" }: {
   );
 }
 
-function ReconstructionView() {
+function metricValue(value?: number | null, suffix = "") {
+  if (value == null) return "N/A";
+  const formatted =
+    Math.abs(value) < 1000 && !Number.isInteger(value)
+      ? value.toFixed(2).replace(/\.?0+$/, "")
+      : formatCompact(value);
+  return `${formatted}${suffix}`;
+}
+
+function ReconstructionLibrary({
+  records,
+  activeId,
+  workerOnline,
+  onActivate,
+  onDelete,
+}: {
+  records: ReconstructionRecord[];
+  activeId: string;
+  workerOnline: boolean;
+  onActivate: (identifier: string) => Promise<void>;
+  onDelete: (identifier: string) => Promise<void>;
+}) {
+  const active = records.find((record) => record.id === activeId);
+  return (
+    <section className="library-layout" aria-label="Past reconstructions">
+      <div className="history-panel">
+        <div className="section-heading compact-heading">
+          <div>
+            <span className="eyebrow">Saved runs</span>
+            <h2>Reconstruction history</h2>
+          </div>
+          <span>{records.length} saved</span>
+        </div>
+        <div className="history-list">
+          {records.map((record) => (
+            <article
+              className={record.id === activeId ? "history-item selected" : "history-item"}
+              key={record.id}
+            >
+              <button className="history-select" onClick={() => onActivate(record.id)}>
+                <span className="history-icon"><Box size={19} /></span>
+                <span>
+                  <strong>{record.title}</strong>
+                  <small>
+                    {new Date(record.created_at).toLocaleDateString()} ·{" "}
+                    {metricValue(record.metrics.registered_images)} registered views
+                  </small>
+                </span>
+                <span className="history-state">
+                  {record.id === activeId ? "Viewing" : "Open model"}
+                </span>
+              </button>
+              <button
+                className="icon-button history-delete"
+                title={`Delete ${record.title}`}
+                disabled={!workerOnline}
+                onClick={() => onDelete(record.id)}
+              >
+                <Trash2 size={16} />
+              </button>
+            </article>
+          ))}
+        </div>
+      </div>
+      <div className="history-video">
+        <div className="video-heading">
+          <div>
+            <span className="eyebrow">Source recording</span>
+            <h2>{active?.title ?? "No active reconstruction"}</h2>
+          </div>
+          <Film size={18} />
+        </div>
+        {active?.video_url ? (
+          <video key={active.id} src={active.video_url} controls playsInline preload="metadata" />
+        ) : (
+          <div className="video-unavailable">
+            <Video size={28} />
+            <span>No saved source video</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ReconstructionView({
+  reconstruction,
+  records,
+  workerOnline,
+  onActivate,
+  onDelete,
+}: {
+  reconstruction: ReconstructionRecord;
+  records: ReconstructionRecord[];
+  workerOnline: boolean;
+  onActivate: (identifier: string) => Promise<void>;
+  onDelete: (identifier: string) => Promise<void>;
+}) {
+  const metrics = reconstruction.metrics;
+  const registered = metrics.registered_images ?? 0;
+  const extracted = metrics.extracted_frames ?? registered;
+  const registrationRatio =
+    metrics.registration_ratio ?? (extracted ? registered / extracted : 0);
   return (
     <>
       <div className="workspace">
-        <ModelViewer />
+        <ModelViewer reconstruction={reconstruction} />
         <aside className="inspector">
           <div className="inspector-heading">
             <div>
               <span className="eyebrow">Active reconstruction</span>
-              <h2>Session 003</h2>
+              <h2>{reconstruction.title}</h2>
             </div>
             <span className="run-state"><Check size={14} /> Complete</span>
           </div>
@@ -351,11 +496,14 @@ function ReconstructionView() {
           <div className="inspector-section">
             <h3>Geometry</h3>
             <dl className="property-list">
-              <div><dt>Dense points</dt><dd>4,060,810</dd></div>
-              <div><dt>Full mesh</dt><dd>1,198,446 faces</dd></div>
-              <div><dt>Portfolio mesh</dt><dd>63,605 faces</dd></div>
-              <div><dt>Scene footprint</dt><dd>400 x 400 mm</dd></div>
-              <div><dt>Reference height</dt><dd>84.14 mm</dd></div>
+              <div><dt>Dense points</dt><dd>{metricValue(metrics.dense_points)}</dd></div>
+              <div><dt>Mesh vertices</dt><dd>{metricValue(metrics.mesh_vertices)}</dd></div>
+              <div><dt>Mesh faces</dt><dd>{metricValue(metrics.mesh_faces)}</dd></div>
+              <div><dt>Sparse landmarks</dt><dd>{metricValue(metrics.sparse_points)}</dd></div>
+              <div>
+                <dt>Reference height</dt>
+                <dd>{metricValue(metrics.reference_height_mm, " mm")}</dd>
+              </div>
             </dl>
           </div>
 
@@ -364,14 +512,18 @@ function ReconstructionView() {
             <div className="quality-row">
               <CircleGauge size={22} />
               <div>
-                <strong>0.856 px</strong>
+                <strong>
+                  {metrics.mean_reprojection_error_px == null
+                    ? "N/A"
+                    : `${metrics.mean_reprojection_error_px.toFixed(3)} px`}
+                </strong>
                 <span>Mean reprojection error</span>
               </div>
             </div>
             <div className="quality-row">
               <Focus size={22} />
               <div>
-                <strong>100%</strong>
+                <strong>{(registrationRatio * 100).toFixed(1)}%</strong>
                 <span>Registered image ratio</span>
               </div>
             </div>
@@ -380,8 +532,8 @@ function ReconstructionView() {
           <div className="inspector-section">
             <h3>Compute profile</h3>
             <dl className="property-list">
-              <div><dt>Dense peak memory</dt><dd>4.11 GB</dd></div>
-              <div><dt>Mesh peak memory</dt><dd>2.63 GB</dd></div>
+              <div><dt>Source duration</dt><dd>{duration(metrics.video_duration_s)}</dd></div>
+              <div><dt>Processing time</dt><dd>{duration(metrics.processing_time_s)}</dd></div>
               <div><dt>Dense backend</dt><dd>OpenMVS CPU</dd></div>
             </dl>
           </div>
@@ -389,23 +541,57 @@ function ReconstructionView() {
       </div>
 
       <div className="metrics-band">
-        <Metric label="Registered views" value="173 / 173" detail="100% of accepted frames" tone="green" />
-        <Metric label="Sparse landmarks" value="31,685" detail="7.74x baseline" />
-        <Metric label="Dense points" value="4.06 M" detail="17.4x baseline" tone="green" />
-        <Metric label="Metric accuracy" value="0.13%" detail="Validation against casing height" tone="amber" />
+        <Metric
+          label="Registered views"
+          value={`${registered} / ${extracted}`}
+          detail={`${(registrationRatio * 100).toFixed(1)}% of accepted frames`}
+          tone="green"
+        />
+        <Metric
+          label="Sparse landmarks"
+          value={metricValue(metrics.sparse_points)}
+          detail={metricValue(metrics.observations) + " feature observations"}
+        />
+        <Metric
+          label="Dense points"
+          value={metricValue(metrics.dense_points)}
+          detail={metricValue(metrics.mesh_faces) + " mesh faces"}
+          tone="green"
+        />
+        <Metric
+          label={metrics.metric_accuracy_percent == null ? "Mean track length" : "Metric accuracy"}
+          value={
+            metrics.metric_accuracy_percent == null
+              ? metricValue(metrics.mean_track_length)
+              : `${metrics.metric_accuracy_percent.toFixed(2)}%`
+          }
+          detail={
+            metrics.metric_accuracy_percent == null
+              ? "Views observing each sparse point"
+              : "Validation against physical reference"
+          }
+          tone="amber"
+        />
       </div>
+      <ReconstructionLibrary
+        records={records}
+        activeId={reconstruction.id}
+        workerOnline={workerOnline}
+        onActivate={onActivate}
+        onDelete={onDelete}
+      />
     </>
   );
 }
 
-function ComparisonBar({ label, baseline, refined, lowerIsBetter = false, unit = "" }: {
+function ComparisonBar({ label, reference, selected, lowerIsBetter = false, unit = "" }: {
   label: string;
-  baseline: number;
-  refined: number;
+  reference: number;
+  selected: number;
   lowerIsBetter?: boolean;
   unit?: string;
 }) {
-  const max = Math.max(baseline, refined);
+  const max = Math.max(reference, selected, Number.EPSILON);
   const displayValue = (value: number) =>
     value < 10 ? value.toFixed(3) : formatCompact(value);
   return (
@@ -416,79 +602,191 @@ function ComparisonBar({ label, baseline, refined, lowerIsBetter = false, unit =
       </div>
       <div className="bar-pair">
         <div className="bar-line">
-          <span>002</span>
-          <div className="bar-track"><i className="bar-baseline" style={{ width: `${(baseline / max) * 100}%` }} /></div>
-          <b>{displayValue(baseline)}{unit}</b>
+          <span>REF</span>
+          <div className="bar-track"><i className="bar-baseline" style={{ width: `${(reference / max) * 100}%` }} /></div>
+          <b>{displayValue(reference)}{unit}</b>
         </div>
         <div className="bar-line">
-          <span>003</span>
-          <div className="bar-track"><i className="bar-refined" style={{ width: `${(refined / max) * 100}%` }} /></div>
-          <b>{displayValue(refined)}{unit}</b>
+          <span>ACTIVE</span>
+          <div className="bar-track"><i className="bar-refined" style={{ width: `${(selected / max) * 100}%` }} /></div>
+          <b>{displayValue(selected)}{unit}</b>
         </div>
       </div>
     </div>
   );
 }
 
-function EvaluationView() {
-  const registrationGain = Math.round(
-    (sessions.refined.registered / sessions.refined.extracted -
-      sessions.baseline.registered / sessions.baseline.extracted) *
-      100,
-  );
+function EvaluationView({
+  reconstruction,
+  records,
+}: {
+  reconstruction: ReconstructionRecord;
+  records: ReconstructionRecord[];
+}) {
+  const reference =
+    records.find((record) => record.id !== reconstruction.id) ?? reconstruction;
+  const selectedMetrics = reconstruction.metrics;
+  const referenceMetrics = reference.metrics;
+  const selectedRegistration =
+    selectedMetrics.registration_ratio ??
+    (selectedMetrics.extracted_frames
+      ? (selectedMetrics.registered_images ?? 0) / selectedMetrics.extracted_frames
+      : 0);
+  const referenceRegistration =
+    referenceMetrics.registration_ratio ??
+    (referenceMetrics.extracted_frames
+      ? (referenceMetrics.registered_images ?? 0) / referenceMetrics.extracted_frames
+      : 0);
+  const registrationDelta = (selectedRegistration - referenceRegistration) * 100;
+  const observationRatio =
+    (selectedMetrics.observations ?? 0) /
+    Math.max(referenceMetrics.observations ?? 0, 1);
+  const reprojectionChange =
+    (((selectedMetrics.mean_reprojection_error_px ?? 0) -
+      (referenceMetrics.mean_reprojection_error_px ?? 0)) /
+      Math.max(
+        referenceMetrics.mean_reprojection_error_px ?? 0,
+        Number.EPSILON,
+      )) *
+    100;
   return (
     <div className="evaluation-layout">
       <section className="evaluation-main">
         <div className="section-heading">
           <div>
-            <span className="eyebrow">Controlled experiment</span>
-            <h2>Capture quality changed the map</h2>
+            <span className="eyebrow">Selected reconstruction comparison</span>
+            <h2>{reconstruction.title}</h2>
           </div>
           <div className="legend">
-            <span><i className="legend-baseline" /> Session 002</span>
-            <span><i className="legend-refined" /> Session 003</span>
+            <span><i className="legend-baseline" /> {reference.title}</span>
+            <span><i className="legend-refined" /> {reconstruction.title}</span>
           </div>
         </div>
         <div className="comparison-list">
-          <ComparisonBar label="Registered images" baseline={59} refined={173} />
-          <ComparisonBar label="Sparse points" baseline={4095} refined={31685} />
-          <ComparisonBar label="Observations" baseline={24332} refined={220309} />
-          <ComparisonBar label="Dense points" baseline={232999} refined={4060810} />
-          <ComparisonBar label="Mesh faces" baseline={114243} refined={1198446} />
-          <ComparisonBar label="Reprojection error" baseline={1.414} refined={0.856} lowerIsBetter unit=" px" />
+          <ComparisonBar
+            label="Registered images"
+            reference={referenceMetrics.registered_images ?? 0}
+            selected={selectedMetrics.registered_images ?? 0}
+          />
+          <ComparisonBar
+            label="Sparse points"
+            reference={referenceMetrics.sparse_points ?? 0}
+            selected={selectedMetrics.sparse_points ?? 0}
+          />
+          <ComparisonBar
+            label="Observations"
+            reference={referenceMetrics.observations ?? 0}
+            selected={selectedMetrics.observations ?? 0}
+          />
+          <ComparisonBar
+            label="Dense points"
+            reference={referenceMetrics.dense_points ?? 0}
+            selected={selectedMetrics.dense_points ?? 0}
+          />
+          <ComparisonBar
+            label="Published mesh faces"
+            reference={referenceMetrics.mesh_faces ?? 0}
+            selected={selectedMetrics.mesh_faces ?? 0}
+          />
+          <ComparisonBar
+            label="Reprojection error"
+            reference={referenceMetrics.mean_reprojection_error_px ?? 0}
+            selected={selectedMetrics.mean_reprojection_error_px ?? 0}
+            lowerIsBetter
+            unit=" px"
+          />
         </div>
       </section>
 
       <aside className="findings-panel">
-        <h3>Measured outcome</h3>
+        <h3>Selected run outcome</h3>
         <div className="finding">
-          <strong>+{registrationGain} pp</strong>
-          <span>Registration improvement</span>
+          <strong>
+            {registrationDelta > 0 ? "+" : ""}
+            {registrationDelta.toFixed(1)} pp
+          </strong>
+          <span>Registration rate versus saved reference</span>
         </div>
         <div className="finding">
-          <strong>9.05×</strong>
-          <span>More feature observations</span>
+          <strong>{observationRatio.toFixed(2)}x</strong>
+          <span>Feature observations versus saved reference</span>
         </div>
         <div className="finding">
-          <strong>−39.4%</strong>
-          <span>Lower reprojection error</span>
+          <strong>{Math.abs(reprojectionChange).toFixed(1)}%</strong>
+          <span>
+            {reprojectionChange <= 0 ? "Lower" : "Higher"} reprojection error
+            versus reference
+          </span>
         </div>
         <div className="finding-note">
           <Activity size={18} />
-          <p>Slow motion, consistent distance, stable lighting, and continuous overlap produced one connected 173-camera model.</p>
+          <p>
+            {reconstruction.title} registered{" "}
+            {selectedMetrics.registered_images ?? 0} of{" "}
+            {selectedMetrics.extracted_frames ?? 0} accepted frames and produced{" "}
+            {metricValue(selectedMetrics.dense_points)} dense points.
+          </p>
         </div>
       </aside>
     </div>
   );
 }
 
-function SystemView() {
+function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord | null }) {
+  if (!reconstruction) return null;
+  const metrics = reconstruction.metrics;
+  const rejected = metrics.blur_rejected_samples;
+  const fullFaces = metrics.full_mesh_faces;
+  const publishedFaces = metrics.mesh_faces;
+  const stages = [
+    {
+      name: "Capture",
+      detail: `${duration(metrics.video_duration_s)} / ${
+        metrics.video_frames == null
+          ? "frame count unavailable"
+          : `${formatCompact(metrics.video_frames)} frames`
+      }`,
+      icon: Video,
+    },
+    {
+      name: "Quality gate",
+      detail: `${metricValue(metrics.extracted_frames)} accepted${
+        rejected == null ? "" : ` / ${metricValue(rejected)} rejected`
+      }`,
+      icon: ScanLine,
+    },
+    {
+      name: "Sparse SfM",
+      detail: `${metricValue(metrics.registered_images)} cameras / ${metricValue(metrics.sparse_points)} points`,
+      icon: Camera,
+    },
+    {
+      name: "Dense MVS",
+      detail: `${metricValue(metrics.dense_depth_maps)} depth maps / ${metricValue(metrics.dense_points)} points`,
+      icon: Database,
+    },
+    {
+      name: "Mesh",
+      detail:
+        fullFaces != null && fullFaces !== publishedFaces
+          ? `${metricValue(fullFaces)} full / ${metricValue(publishedFaces)} published faces`
+          : `${metricValue(publishedFaces)} published faces`,
+      icon: Triangle,
+    },
+    {
+      name: reconstruction.viewer?.metric ? "Metric export" : "GLB export",
+      detail: reconstruction.viewer?.metric
+        ? `${metricValue(metrics.reference_height_mm, " mm")} reference / ${reconstruction.viewer?.up_axis ?? "Z-up"}`
+        : `Textured mesh / ${reconstruction.viewer?.up_axis ?? "Y-up"} SfM units`,
+      icon: Gauge,
+    },
+  ];
   return (
     <div className="system-layout">
       <section className="pipeline-panel">
         <div className="section-heading">
           <div>
-            <span className="eyebrow">Field-to-laptop workflow</span>
+            <span className="eyebrow">{reconstruction.title}</span>
             <h2>System execution trace</h2>
           </div>
           <span className="run-state"><Check size={14} /> 6 / 6 stages</span>
@@ -512,20 +810,45 @@ function SystemView() {
         <div className="video-heading">
           <div>
             <span className="eyebrow">Deployment evidence</span>
-            <h2>Portfolio rotation</h2>
+            <h2>{reconstruction.title}</h2>
           </div>
-          <span>30.3 s</span>
+          <span>{duration(metrics.video_duration_s)}</span>
         </div>
-        <video controls loop muted playsInline preload="metadata">
-          <source src="/media/portfolio-clip.mp4" type="video/mp4" />
-        </video>
+        {reconstruction.video_url ? (
+          <video
+            key={reconstruction.id}
+            src={reconstruction.video_url}
+            controls
+            loop
+            muted
+            playsInline
+            preload="metadata"
+          />
+        ) : (
+          <div className="video-unavailable">
+            <Video size={28} />
+            <span>No saved source video</span>
+          </div>
+        )}
       </section>
 
       <section className="deployment-strip">
         <div><Cpu size={21} /><strong>Intel i7 CPU</strong><span>Dense MVS fallback</span></div>
-        <div><Server size={21} /><strong>Raspberry Pi 5</strong><span>Field capture target</span></div>
-        <div><Wifi size={21} /><strong>Portable link</strong><span>Wi-Fi result serving</span></div>
-        <div><Box size={21} /><strong>Metric PLY / GLB</strong><span>Deployment artifacts</span></div>
+        <div>
+          <Server size={21} />
+          <strong>{reconstruction.source === "field" ? "Raspberry Pi 5" : "Laptop webcam"}</strong>
+          <span>{reconstruction.source === "field" ? "Field coordinator" : "Portfolio capture"}</span>
+        </div>
+        <div>
+          <Wifi size={21} />
+          <strong>{reconstruction.source === "field" ? "Portable Wi-Fi link" : "Local workflow"}</strong>
+          <span>{reconstruction.source === "field" ? "Remote capture and transfer" : "Laptop capture and processing"}</span>
+        </div>
+        <div>
+          <Box size={21} />
+          <strong>{reconstruction.viewer?.metric ? "Metric GLB" : "Textured GLB"}</strong>
+          <span>{metricValue(metrics.mesh_faces)} published faces</span>
+        </div>
       </section>
     </div>
   );
@@ -550,7 +873,11 @@ function duration(value?: number | null) {
   return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function FieldView() {
+function FieldView({
+  onReconstructionReady,
+}: {
+  onReconstructionReady: (identifier: string) => Promise<void>;
+}) {
   const [status, setStatus] = useState<FieldStatus | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -560,6 +887,8 @@ function FieldView() {
   const [direction, setDirection] = useState("right");
   const [imageVersion, setImageVersion] = useState(0);
   const [clock, setClock] = useState(Date.now());
+  const [job, setJob] = useState<ReconstructionJob | null>(null);
+  const completedJobRef = useRef<string | null>(null);
 
   const refresh = async () => {
     try {
@@ -567,6 +896,16 @@ function FieldView() {
       if (!response.ok) throw new Error(`Coordinator returned ${response.status}`);
       const payload = (await response.json()) as FieldStatus;
       setStatus(payload);
+      if (payload.session?.reconstruction_job_id && !job) {
+        const jobResponse = await fetch(
+          `/api/reconstruction/jobs/${payload.session.reconstruction_job_id}`,
+          { cache: "no-store" },
+        );
+        if (jobResponse.ok) {
+          const jobPayload = await jobResponse.json();
+          setJob(jobPayload.job as ReconstructionJob);
+        }
+      }
       setError("");
     } catch {
       setStatus(null);
@@ -579,6 +918,35 @@ function FieldView() {
     const timer = window.setInterval(refresh, 2000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!job || job.status === "complete" || job.status === "failed") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await fetch(`/api/reconstruction/jobs/${job.id}`, {
+          cache: "no-store",
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "Could not read job status");
+        setJob(payload.job as ReconstructionJob);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "Could not read job status");
+      }
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [job?.id, job?.status]);
+
+  useEffect(() => {
+    if (
+      job?.status !== "complete" ||
+      !job.result?.id ||
+      completedJobRef.current === job.id
+    ) {
+      return;
+    }
+    completedJobRef.current = job.id;
+    void onReconstructionReady(job.result.id);
+  }, [job, onReconstructionReady]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -603,6 +971,22 @@ function FieldView() {
       setImageVersion((value) => value + 1);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Command failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reconstruct = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/field/reconstruct", { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Could not start reconstruction");
+      setJob(payload.job as ReconstructionJob);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not start reconstruction");
     } finally {
       setBusy(false);
     }
@@ -671,8 +1055,10 @@ function FieldView() {
             <strong>
               {session?.recording
                 ? `Carry the camera slowly ${direction} around the stationary target. Keep 60-80% overlap.`
+                : job?.status === "running" || job?.status === "queued"
+                  ? job.message
                 : session?.latest_video
-                  ? "Video saved on the Pi. Download it or finish the session for reconstruction."
+                  ? "Video saved on the Pi. Start reconstruction when the orbit looks usable."
                   : "Keep the target still, then physically carry the camera around it."}
             </strong>
           </div>
@@ -730,8 +1116,27 @@ function FieldView() {
               </button>
             ) : (
               <>
-                <a
+                <button
                   className="command primary"
+                  disabled={
+                    busy ||
+                    !status?.reconstruction?.connected ||
+                    job?.status === "queued" ||
+                    job?.status === "running"
+                  }
+                  onClick={reconstruct}
+                >
+                  {job?.status === "queued" || job?.status === "running" ? (
+                    <LoaderCircle size={17} className="spin" />
+                  ) : (
+                    <Box size={17} />
+                  )}
+                  {job?.status === "queued" || job?.status === "running"
+                    ? "Reconstructing"
+                    : "Reconstruct video"}
+                </button>
+                <a
+                  className="command"
                   href="/api/field/video.mp4"
                   download={`${session.session_id}.mp4`}
                 >
@@ -748,6 +1153,18 @@ function FieldView() {
             )}
           </div>
         </div>
+        {job && (
+          <div className={`job-status job-${job.status}`}>
+            <div>
+              <span>{job.stage.replaceAll("_", " ")}</span>
+              <strong>{job.message}</strong>
+            </div>
+            <b>{Math.round(job.progress)}%</b>
+            <div className="job-progress">
+              <i style={{ width: `${Math.max(2, job.progress)}%` }} />
+            </div>
+          </div>
+        )}
         {error && <div className="field-error">{error}</div>}
       </section>
 
@@ -799,6 +1216,7 @@ function FieldView() {
             <div><dt>Resolution</dt><dd>{session?.video_metadata?.width ? `${session.video_metadata.width} x ${session.video_metadata.height}` : "Live camera"}</dd></div>
             <div><dt>Video size</dt><dd>{bytes(session?.video_metadata?.stored_bytes)}</dd></div>
             <div><dt>Laptop link</dt><dd>{status?.camera.connected ? "Online" : "Offline"}</dd></div>
+            <div><dt>Reconstruction worker</dt><dd>{status?.reconstruction?.connected ? "Online" : "Offline"}</dd></div>
             <div><dt>Target overlap</dt><dd>60-80%</dd></div>
           </dl>
         </div>
@@ -814,12 +1232,119 @@ function FieldView() {
 
 function App() {
   const [view, setView] = useState<ViewName>("reconstruction");
+  const [catalog, setCatalog] = useState<ReconstructionCatalog>({
+    active_id: null,
+    items: [],
+  });
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [workerOnline, setWorkerOnline] = useState(false);
+
+  const loadCatalog = async (preferredId?: string) => {
+    try {
+      const response = await fetch("/api/reconstructions", { cache: "no-store" });
+      if (!response.ok || !response.headers.get("content-type")?.includes("json")) {
+        throw new Error("Dynamic reconstruction API is unavailable");
+      }
+      const payload = (await response.json()) as ReconstructionCatalog;
+      setCatalog({
+        ...payload,
+        active_id:
+          preferredId && payload.items.some((item) => item.id === preferredId)
+            ? preferredId
+            : payload.active_id,
+      });
+      setWorkerOnline(true);
+    } catch {
+      const response = await fetch("/reconstructions/catalog.json", { cache: "no-store" });
+      const payload = (await response.json()) as ReconstructionCatalog;
+      setCatalog({
+        ...payload,
+        active_id:
+          preferredId && payload.items.some((item) => item.id === preferredId)
+            ? preferredId
+            : payload.active_id,
+      });
+      setWorkerOnline(false);
+    } finally {
+      setCatalogLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadCatalog();
+  }, []);
+
+  const activate = async (identifier: string) => {
+    if (workerOnline) {
+      const response = await fetch(`/api/reconstructions/${identifier}/activate`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Could not activate reconstruction");
+      setCatalog({ active_id: payload.active_id, items: payload.items });
+    } else {
+      setCatalog((current) => ({ ...current, active_id: identifier }));
+    }
+  };
+
+  const remove = async (identifier: string) => {
+    const record = catalog.items.find((item) => item.id === identifier);
+    if (!record || !window.confirm(`Delete ${record.title} and its saved video?`)) return;
+    const response = await fetch(`/api/reconstructions/${identifier}`, { method: "DELETE" });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Could not delete reconstruction");
+    setCatalog({ active_id: payload.active_id, items: payload.items });
+  };
+
+  const reconstructionReady = async (identifier: string) => {
+    await loadCatalog(identifier);
+    setView("reconstruction");
+  };
+
+  const activeReconstruction =
+    catalog.items.find((item) => item.id === catalog.active_id) ?? catalog.items[0] ?? null;
   const viewContent = useMemo(() => {
-    if (view === "evaluation") return <EvaluationView />;
-    if (view === "system") return <SystemView />;
-    if (view === "field") return <FieldView />;
-    return <ReconstructionView />;
-  }, [view]);
+    if (view === "field") {
+      return <FieldView onReconstructionReady={reconstructionReady} />;
+    }
+    if (catalogLoading) {
+      return (
+        <div className="empty-state">
+          <LoaderCircle size={24} className="spin" />
+          <strong>Loading reconstruction library</strong>
+        </div>
+      );
+    }
+    if (!activeReconstruction) {
+      return (
+        <div className="empty-state">
+          <Box size={28} />
+          <strong>No saved reconstructions</strong>
+          <span>Record a field video and reconstruct it to create the first entry.</span>
+        </div>
+      );
+    }
+    if (view === "evaluation") {
+      return (
+        <EvaluationView
+          reconstruction={activeReconstruction}
+          records={catalog.items}
+        />
+      );
+    }
+    if (view === "system") {
+      return <SystemView reconstruction={activeReconstruction} />;
+    }
+    return (
+      <ReconstructionView
+        reconstruction={activeReconstruction}
+        records={catalog.items}
+        workerOnline={workerOnline}
+        onActivate={activate}
+        onDelete={remove}
+      />
+    );
+  }, [view, catalog, catalogLoading, workerOnline, activeReconstruction]);
 
   return (
     <main className="app-shell">
@@ -844,7 +1369,7 @@ function App() {
         </nav>
         <div className="header-status">
           <span className="status-dot" />
-          Session 003
+          {activeReconstruction?.title ?? "No active reconstruction"}
         </div>
       </header>
       <div className="page-content">{viewContent}</div>

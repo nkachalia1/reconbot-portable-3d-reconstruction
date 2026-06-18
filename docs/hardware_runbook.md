@@ -11,10 +11,11 @@ Laptop webcam -> laptop camera service -> Wi-Fi -> Raspberry Pi coordinator
                                                 -> live dashboard
 ```
 
-The laptop service owns webcam access, live preview, and MP4 recording. The Pi
-starts and stops recordings, copies completed videos into the field session,
-records telemetry, and serves the operator dashboard. Reconstruction remains
-on the laptop.
+The laptop service owns webcam access, live preview, MP4 recording, and a
+separate reconstruction worker. The Pi starts and stops recordings, copies
+completed videos into the field session, records telemetry, proxies
+reconstruction jobs, and serves the operator dashboard. COLMAP and OpenMVS
+remain on the laptop.
 
 ## Local Simulation First
 
@@ -54,9 +55,13 @@ Set a shared token and start the sensor service:
 
 ```powershell
 $env:RECONBOT_TOKEN = "replace-with-a-long-random-token"
+$env:RECONBOT_OPENMVS_BIN = "$HOME\Downloads\OpenMVS_Windows_x64\vc17\x64\Release"
 .\.venv-win\Scripts\python scripts/laptop_camera_node.py `
   --host 0.0.0.0 --port 5001 --camera-index 0
 ```
+
+This command also starts the reconstruction worker on port `5002`. Add
+`--no-reconstruction-worker` only when intentionally running capture by itself.
 
 Confirm locally:
 
@@ -69,7 +74,7 @@ Pi, allow inbound TCP port 5001 on the private network:
 
 ```powershell
 New-NetFirewallRule -DisplayName "ReconBot Camera Node" `
-  -Direction Inbound -Protocol TCP -LocalPort 5001 -Action Allow -Profile Private
+  -Direction Inbound -Protocol TCP -LocalPort 5001,5002 -Action Allow -Profile Private
 ```
 
 ## Raspberry Pi Setup
@@ -92,6 +97,7 @@ on the Pi. Then test the coordinator interactively:
 
 ```bash
 export RECONBOT_CAMERA_URL=http://LAPTOP_IPV4:5001
+export RECONBOT_RECONSTRUCTION_URL=http://LAPTOP_IPV4:5002
 export RECONBOT_TOKEN=replace-with-a-long-random-token
 python scripts/pi_coordinator.py
 ```
@@ -129,33 +135,32 @@ journalctl -u reconbot-coordinator -f
    smooth orbit around the target.
 7. Record for 45 to 90 seconds while maintaining 60 to 80 percent overlap.
 8. Click **Stop recording** and confirm that playback appears.
-9. Leave the completed session available on the Pi for laptop reconstruction.
+9. Click **Reconstruct video** and monitor the stage and percentage readout.
+10. When processing completes, the dashboard opens the new model and adds it
+    to Reconstruction history.
 
-## Reconstruct The Latest Video
+## Automated Reconstruction
 
-From Ubuntu/WSL on the laptop:
-
-```bash
-cd "/mnt/c/Users/Neel/Documents/3D Scene Reconstruction"
-source .venv/bin/activate
-python scripts/fetch_field_video.py \
-  --coordinator-url http://pi5.local:5000 \
-  --every-n 5 \
-  --min-blur 40 \
-  --run-colmap
-```
-
-This downloads the Pi's latest video, extracts sharp frames, uses
-`configs/camera_intrinsics.yaml` when available, and creates:
+The Windows worker performs the existing manual pipeline automatically:
 
 ```text
-data/raw/<session>.mp4
-data/frames/<session>/
-outputs/colmap/<session>/sparse/0
+video -> sharp frames -> WSL COLMAP sparse SfM -> image undistortion
+      -> Windows OpenMVS dense cloud -> 300k-face mesh -> texture -> GLB
 ```
 
-Validate the sparse model before running the OpenMVS dense workflow in
-`docs/colmap_pipeline.md`.
+Published artifacts are stored under:
+
+```text
+data/reconstruction_library/<session>/video.mp4
+data/reconstruction_library/<session>/model.glb
+data/reconstruction_library/<session>/metrics.json
+data/reconstruction_library/<session>/pipeline.log
+```
+
+Successful jobs remove their multi-gigabyte intermediate depth maps to protect
+laptop storage. Failed jobs retain the work directory and pipeline log for
+diagnosis. The older `scripts/fetch_field_video.py` command remains available
+as a manual recovery path.
 
 ## Capture Rules
 

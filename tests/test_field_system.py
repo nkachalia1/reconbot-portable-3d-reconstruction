@@ -68,6 +68,53 @@ class FakeCameraClient:
         target.write_bytes(b"fake-video")
 
 
+class FakeReconstructionClient:
+    def health(self) -> dict[str, object]:
+        return {"ok": True, "role": "reconstruction-worker"}
+
+    def list_reconstructions(self) -> dict[str, object]:
+        return {
+            "active_id": "integration",
+            "items": [{"id": "integration", "title": "Integration"}],
+        }
+
+    def submit(
+        self,
+        session_id: str,
+        video_path: Path,
+        parameters: dict[str, object],
+    ) -> dict[str, object]:
+        assert session_id == "integration"
+        assert video_path.read_bytes() == b"fake-video"
+        assert parameters["target_faces"] == 300000
+        return {
+            "job": {
+                "id": "job-1",
+                "reconstruction_id": "integration",
+                "status": "queued",
+            }
+        }
+
+    def job(self, job_id: str) -> dict[str, object]:
+        assert job_id == "job-1"
+        return {"job": {"id": job_id, "status": "complete"}}
+
+    def activate(self, identifier: str) -> dict[str, object]:
+        return {"active_id": identifier, "items": []}
+
+    def delete(self, identifier: str) -> dict[str, object]:
+        return {"active_id": None, "items": [], "deleted": identifier}
+
+    def asset(
+        self,
+        identifier: str,
+        filename: str,
+        range_header: str | None = None,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        assert identifier == "integration"
+        return 200, f"{filename}:{range_header}".encode(), {"Content-Type": "application/octet-stream"}
+
+
 def test_session_store_persists_capture_artifacts(tmp_path: Path):
     store = SessionStore(tmp_path)
     store.start("demo session", "left")
@@ -82,7 +129,11 @@ def test_session_store_persists_capture_artifacts(tmp_path: Path):
 
 
 def test_coordinator_http_workflow(tmp_path: Path):
-    app = create_coordinator_app(FakeCameraClient(), tmp_path)
+    app = create_coordinator_app(
+        FakeCameraClient(),
+        tmp_path,
+        reconstruction_client=FakeReconstructionClient(),
+    )
     client = app.test_client()
 
     status = client.get("/api/field/status")
@@ -119,6 +170,22 @@ def test_coordinator_http_workflow(tmp_path: Path):
     video = client.get("/api/field/video.mp4")
     assert video.status_code == 200
     assert video.data == b"fake-video"
+
+    reconstruction = client.post("/api/field/reconstruct")
+    assert reconstruction.status_code == 202
+    assert reconstruction.get_json()["job"]["id"] == "job-1"
+
+    job = client.get("/api/reconstruction/jobs/job-1")
+    assert job.status_code == 200
+    assert job.get_json()["job"]["status"] == "complete"
+
+    library = client.get("/api/reconstructions")
+    assert library.status_code == 200
+    assert library.get_json()["active_id"] == "integration"
+
+    model = client.get("/api/reconstructions/integration/model.glb")
+    assert model.status_code == 200
+    assert model.data.startswith(b"model.glb")
 
     stopped = client.post("/api/field/session/stop")
     assert stopped.status_code == 200

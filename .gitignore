@@ -11,6 +11,7 @@ dashboard/dist/
 data/raw/*
 !data/raw/.gitkeep
 data/camera_recordings/*
+data/reconstruction_library/*
 data/calibration/*
 !data/calibration/.gitkeep
 data/frames/*
@@ -23,7 +24,7 @@ outputs/*
 *.mp4
 *.mov
 *.mkv
-!dashboard/public/media/portfolio-clip.mp4
+!dashboard/public/reconstructions/*/video.mp4
 *.ply
 *.pcd
 *.obj
