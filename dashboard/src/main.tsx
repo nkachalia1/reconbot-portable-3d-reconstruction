@@ -901,6 +901,7 @@ function FieldView({
   const [clock, setClock] = useState(Date.now());
   const [job, setJob] = useState<ReconstructionJob | null>(null);
   const completedJobRef = useRef<string | null>(null);
+  const watchedJobRef = useRef<string | null>(null);
 
   const refresh = async () => {
     try {
@@ -949,14 +950,20 @@ function FieldView({
   }, [job?.id, job?.status]);
 
   useEffect(() => {
+    if (job?.status === "queued" || job?.status === "running") {
+      watchedJobRef.current = job.id;
+      return;
+    }
     if (
       job?.status !== "complete" ||
       !job.result?.id ||
+      watchedJobRef.current !== job.id ||
       completedJobRef.current === job.id
     ) {
       return;
     }
     completedJobRef.current = job.id;
+    watchedJobRef.current = null;
     void onReconstructionReady(job.result.id);
   }, [job, onReconstructionReady]);
 
@@ -995,7 +1002,9 @@ function FieldView({
       const response = await fetch("/api/field/reconstruct", { method: "POST" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Could not start reconstruction");
-      setJob(payload.job as ReconstructionJob);
+      const submittedJob = payload.job as ReconstructionJob;
+      watchedJobRef.current = submittedJob.id;
+      setJob(submittedJob);
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not start reconstruction");

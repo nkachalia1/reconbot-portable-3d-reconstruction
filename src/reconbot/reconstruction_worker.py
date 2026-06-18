@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,9 @@ from uuid import uuid4
 
 from .frame_extraction import extract_adaptive_keyframes
 from .io_utils import ensure_dir, load_intrinsics_yaml, write_json
+
+
+FIELD_VIEWER_ROTATION_X = math.pi
 
 
 def _utc_now() -> str:
@@ -134,6 +138,7 @@ class ReconstructionCatalog:
         self.seed_root = Path(seed_root).resolve() if seed_root else None
         self._lock = threading.RLock()
         self._state = self._load_state()
+        self._migrate_field_viewer_orientation()
         self._bootstrap_seeds()
 
     def _load_state(self) -> dict[str, object]:
@@ -143,6 +148,20 @@ class ReconstructionCatalog:
 
     def _save(self) -> None:
         write_json(self.state_path, self._state)
+
+    def _migrate_field_viewer_orientation(self) -> None:
+        changed = False
+        for record in self._state.get("records", []):
+            if record.get("source") != "field":
+                continue
+            viewer = dict(record.get("viewer") or {})
+            if float(viewer.get("rotation_x") or 0.0) == 0.0:
+                viewer["rotation_x"] = FIELD_VIEWER_ROTATION_X
+                viewer.setdefault("up_axis", "Y-up")
+                record["viewer"] = viewer
+                changed = True
+        if changed:
+            self._save()
 
     def _bootstrap_seeds(self) -> None:
         if self.seed_root is None:
@@ -879,7 +898,7 @@ class ReconstructionPipeline:
             "source": "field",
             "metrics": metrics,
             "viewer": {
-                "rotation_x": 0,
+                "rotation_x": FIELD_VIEWER_ROTATION_X,
                 "up_axis": "Y-up",
                 "scale_label": "Auto-fit",
                 "metric": False,

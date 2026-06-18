@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 from pathlib import Path
 import time
 
@@ -69,6 +70,34 @@ def test_catalog_bootstraps_activates_and_deletes_seed(tmp_path: Path):
 
     restarted = ReconstructionCatalog(tmp_path / "library", _seed_library(tmp_path))
     assert restarted.list_public()["items"] == []
+
+
+def test_catalog_migrates_field_models_to_upright_orientation(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "catalog.json").write_text(
+        json.dumps(
+            {
+                "active_id": "field-run",
+                "deleted_seed_ids": [],
+                "records": [
+                    {
+                        "id": "field-run",
+                        "source": "field",
+                        "viewer": {"rotation_x": 0, "up_axis": "Y-up"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = ReconstructionCatalog(library)
+
+    record = catalog.list_public()["items"][0]
+    assert record["viewer"]["rotation_x"] == math.pi
+    persisted = json.loads((library / "catalog.json").read_text(encoding="utf-8"))
+    assert persisted["records"][0]["viewer"]["rotation_x"] == math.pi
 
 
 def test_worker_api_publishes_completed_job(tmp_path: Path):
