@@ -126,16 +126,79 @@ class VideoRecorder:
         self._height = 0
         self._started_at: float | None = None
         self._stopped_at: float | None = None
+        self._discover_latest_recording()
 
     @property
     def recording(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def _discover_latest_recording(self) -> None:
+        candidates = [
+            path
+            for path in self.output_dir.glob("*.mp4")
+            if not path.name.endswith("_capture.mp4")
+        ]
+        if not candidates:
+            return
+        latest = max(candidates, key=lambda path: path.stat().st_mtime)
+        self._path = latest
+        self._stopped_at = latest.stat().st_mtime
+        timestamp_match = re.search(r"_(\d{10})\.mp4$", latest.name)
+        if timestamp_match:
+            self._started_at = float(timestamp_match.group(1))
+        try:
+            cv2 = require_cv2()
+            capture = cv2.VideoCapture(str(latest))
+            try:
+                self._frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                self._fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0) or 15.0
+                self._width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                self._height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            finally:
+                capture.release()
+        except (ImportError, RuntimeError):
+            return
+        duration = self._frames / self._fps if self._fps > 0 else 0.0
+        if self._started_at is None:
+            self._started_at = self._stopped_at - duration
+        self._stopped_at = self._started_at + duration
+
+    def latest(self) -> dict[str, object] | None:
+        with self._lock:
+            if (
+                self.recording
+                or self._path is None
+                or self._path.name.endswith("_capture.mp4")
+                or not self._path.exists()
+            ):
+                return None
+            duration = (
+                self._frames / self._fps
+                if self._frames > 0 and self._fps > 0
+                else (
+                    0.0
+                    if self._started_at is None or self._stopped_at is None
+                    else self._stopped_at - self._started_at
+                )
+            )
+            return {
+                "ok": True,
+                "filename": self._path.name,
+                "started_at": self._started_at,
+                "stopped_at": self._stopped_at,
+                "duration_s": duration,
+                "frames": self._frames,
+                "fps": self._fps,
+                "width": self._width,
+                "height": self._height,
+                "bytes": self._path.stat().st_size,
+            }
+
     def status(self) -> dict[str, object]:
         with self._lock:
             started_at = self._started_at
             end_time = time.time() if self.recording else self._stopped_at
-            return {
+            status = {
                 "recording": self.recording,
                 "frames": self._frames,
                 "fps": self._fps,
@@ -146,6 +209,10 @@ class VideoRecorder:
                     else end_time - started_at
                 ),
             }
+            latest = self.latest()
+            if latest is not None:
+                status.update(latest)
+            return status
 
     def start(self, session_id: str, fps: float = 15.0) -> dict[str, object]:
         cv2 = require_cv2()
@@ -251,23 +318,10 @@ class VideoRecorder:
                 )
             raw_path.unlink()
             self._path = final_path
-            duration = (
-                0.0
-                if self._started_at is None
-                else self._stopped_at - self._started_at
-            )
-            return {
-                "ok": True,
-                "filename": self._path.name,
-                "started_at": self._started_at,
-                "stopped_at": self._stopped_at,
-                "duration_s": duration,
-                "frames": self._frames,
-                "fps": self._fps,
-                "width": self._width,
-                "height": self._height,
-                "bytes": self._path.stat().st_size,
-            }
+            latest = self.latest()
+            if latest is None:
+                raise RuntimeError("The completed video could not be indexed")
+            return latest
 
     def path_for(self, filename: str) -> Path:
         candidate = (self.output_dir / Path(filename).name).resolve()
@@ -403,6 +457,13 @@ def create_camera_app(
             result = recorder.stop()
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
+        return jsonify(result)
+
+    @app.get("/api/video/latest")
+    def latest_video():
+        result = recorder.latest()
+        if result is None:
+            return jsonify({"error": "No completed video is available"}), 404
         return jsonify(result)
 
     @app.get("/api/video/<path:filename>")

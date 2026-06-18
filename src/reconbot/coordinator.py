@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 import http.client
 import json
@@ -51,6 +51,9 @@ class CameraClient(Protocol):
 
     def stop_video(self) -> dict[str, object]:
         """Stop recording and return video metadata."""
+
+    def latest_video(self) -> dict[str, object]:
+        """Return metadata for the newest completed camera recording."""
 
     def download_video(self, filename: str, target: Path) -> None:
         """Download a completed recording to target."""
@@ -106,6 +109,7 @@ class HttpCameraClient:
         path: str,
         method: str = "GET",
         payload: dict[str, object] | None = None,
+        timeout_s: float | None = None,
     ) -> dict[str, object]:
         headers = self._headers()
         data = None
@@ -113,7 +117,7 @@ class HttpCameraClient:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
         request = Request(self.base_url + path, method=method, headers=headers, data=data)
-        with urlopen(request, timeout=self.timeout_s) as response:
+        with urlopen(request, timeout=timeout_s or self.timeout_s) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def health(self) -> dict[str, object]:
@@ -138,7 +142,10 @@ class HttpCameraClient:
         )
 
     def stop_video(self) -> dict[str, object]:
-        return self._request("/api/video/stop", "POST")
+        return self._request("/api/video/stop", "POST", timeout_s=600.0)
+
+    def latest_video(self) -> dict[str, object]:
+        return self._request("/api/video/latest")
 
     def download_video(self, filename: str, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +288,23 @@ class SessionStore:
     def __init__(self, root: str | Path) -> None:
         self.root = ensure_dir(root).resolve()
         self._lock = threading.Lock()
-        self.current: FieldSession | None = None
+        self.current: FieldSession | None = self._load_active_session()
+
+    def _load_active_session(self) -> FieldSession | None:
+        active_sessions: list[tuple[float, FieldSession]] = []
+        allowed = {item.name for item in fields(FieldSession)}
+        for path in self.root.glob("*/session.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                filtered = {key: value for key, value in payload.items() if key in allowed}
+                session = FieldSession(**filtered)
+            except (OSError, ValueError, TypeError):
+                continue
+            if session.active:
+                active_sessions.append((path.stat().st_mtime, session))
+        if not active_sessions:
+            return None
+        return max(active_sessions, key=lambda item: item[0])[1]
 
     def start(self, session_id: str, arc_direction: str, notes: str = "") -> FieldSession:
         with self._lock:
@@ -394,6 +417,13 @@ class SessionStore:
             if self.current is not None:
                 self.current.recording = False
                 self._persist_state()
+
+    def can_attach_video(self, filename: str) -> bool:
+        with self._lock:
+            if self.current is None or not self.current.active:
+                return False
+            safe_name = Path(filename).name
+            return safe_name.startswith(self.current.session_id + "_")
 
     def set_reconstruction_job(self, job_id: str) -> FieldSession:
         with self._lock:
@@ -533,11 +563,47 @@ def create_coordinator_app(
         except RuntimeError as exc:
             store.abort_video()
             return jsonify({"error": str(exc)}), 409
-        except (URLError, OSError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
+        except (URLError, OSError, TimeoutError, ValueError, KeyError) as exc:
             store.abort_video()
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             return jsonify({"error": f"Could not save recording: {exc}"}), 503
+        return jsonify({"ok": True, "session": asdict(session)})
+
+    @app.post("/api/field/video/recover")
+    def recover_video():
+        if store.current is None or not store.current.active:
+            return jsonify({"error": "Start or restore a field session first"}), 409
+        if store.current.recording:
+            return jsonify({"error": "Stop the active recording before recovery"}), 409
+        if store.current.latest_video is not None:
+            return jsonify({"ok": True, "session": asdict(store.current)})
+        temporary: Path | None = None
+        try:
+            payload = camera_client.latest_video()
+            filename = str(payload.get("filename") or "")
+            if not store.can_attach_video(filename):
+                return jsonify(
+                    {
+                        "error": (
+                            "The newest camera recording does not belong to "
+                            f"session {store.current.session_id}"
+                        )
+                    }
+                ), 409
+            target = store.video_target(filename)
+            temporary = target.with_suffix(target.suffix + ".part")
+            camera_client.download_video(filename, temporary)
+            temporary.replace(target)
+            session = store.finish_video(payload, target)
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except HTTPError as exc:
+            return jsonify({"error": f"Could not recover recording: {exc.reason}"}), exc.code
+        except (URLError, OSError, TimeoutError, ValueError, KeyError) as exc:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            return jsonify({"error": f"Could not recover recording: {exc}"}), 503
         return jsonify({"ok": True, "session": asdict(session)})
 
     @app.post("/api/field/session/stop")

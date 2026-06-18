@@ -107,6 +107,11 @@ type FieldStatus = {
       fps?: number;
       started_at?: number | null;
       duration_s?: number;
+      filename?: string;
+      stopped_at?: number | null;
+      bytes?: number;
+      width?: number;
+      height?: number;
     };
   };
   reconstruction?: {
@@ -1008,6 +1013,13 @@ function FieldView({
     status?.pi.memory_total_bytes && status.pi.memory_used_bytes
       ? (status.pi.memory_used_bytes / status.pi.memory_total_bytes) * 100
       : null;
+  const recoverableFilename = status?.camera.video?.filename;
+  const canRecoverRecording = Boolean(
+    session?.active &&
+      !session.recording &&
+      !session.latest_video &&
+      recoverableFilename?.startsWith(`${session.session_id}_`),
+  );
 
   return (
     <div className="field-layout">
@@ -1050,6 +1062,8 @@ function FieldView({
                 ? `REC ${duration(recordingDuration)}`
                 : session?.latest_video
                   ? "Recording ready"
+                  : canRecoverRecording
+                    ? "Recording awaiting transfer"
                   : "Live preview"}
             </span>
           </div>
@@ -1066,6 +1080,8 @@ function FieldView({
                   ? job.message
                 : session?.latest_video
                   ? "Video saved on the Pi. Start reconstruction when the orbit looks usable."
+                  : canRecoverRecording
+                    ? "The laptop saved this recording. Recover it to the Pi, then reconstruct it."
                   : "Keep the target still, then physically carry the camera around it."}
             </strong>
           </div>
@@ -1114,13 +1130,23 @@ function FieldView({
                 <Square size={15} /> Stop recording
               </button>
             ) : !session.latest_video ? (
-              <button
-                className="command record"
-                disabled={busy}
-                onClick={() => command("/api/field/video/start", { fps: 15 })}
-              >
-                <Video size={17} /> Start recording
-              </button>
+              canRecoverRecording ? (
+                <button
+                  className="command primary"
+                  disabled={busy}
+                  onClick={() => command("/api/field/video/recover")}
+                >
+                  <Download size={17} /> Recover recording
+                </button>
+              ) : (
+                <button
+                  className="command record"
+                  disabled={busy}
+                  onClick={() => command("/api/field/video/start", { fps: 15 })}
+                >
+                  <Video size={17} /> Start recording
+                </button>
+              )
             ) : (
               <>
                 <button

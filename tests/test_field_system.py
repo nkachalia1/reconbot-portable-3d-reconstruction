@@ -62,8 +62,14 @@ class FakeCameraClient:
             "bytes": 10,
         }
 
+    def latest_video(self) -> dict[str, object]:
+        return {
+            **self.stop_video(),
+            "filename": "integration_1750000000.mp4",
+        }
+
     def download_video(self, filename: str, target: Path) -> None:
-        assert filename == "field-video.mp4"
+        assert filename in {"field-video.mp4", "integration_1750000000.mp4"}
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"fake-video")
 
@@ -128,6 +134,17 @@ def test_session_store_persists_capture_artifacts(tmp_path: Path):
     assert "left" in str(session.last_guidance["recommendation"])
 
 
+def test_session_store_restores_latest_active_session(tmp_path: Path):
+    store = SessionStore(tmp_path)
+    store.start("restored session", "right")
+
+    restored = SessionStore(tmp_path)
+
+    assert restored.current is not None
+    assert restored.current.session_id == "restored_session"
+    assert restored.current.active is True
+
+
 def test_coordinator_http_workflow(tmp_path: Path):
     app = create_coordinator_app(
         FakeCameraClient(),
@@ -190,3 +207,20 @@ def test_coordinator_http_workflow(tmp_path: Path):
     stopped = client.post("/api/field/session/stop")
     assert stopped.status_code == 200
     assert stopped.get_json()["session"]["active"] is False
+
+
+def test_coordinator_recovers_camera_video_after_restart(tmp_path: Path):
+    first_store = SessionStore(tmp_path)
+    first_store.start("integration", "right")
+    first_store.begin_video({"started_at": 1_750_000_000.0, "fps": 15.0})
+    first_store.abort_video()
+
+    app = create_coordinator_app(FakeCameraClient(), tmp_path)
+    client = app.test_client()
+
+    recovered = client.post("/api/field/video/recover")
+
+    assert recovered.status_code == 200
+    session = recovered.get_json()["session"]
+    assert session["latest_video"] == "video/integration_1750000000.mp4"
+    assert (tmp_path / "integration" / session["latest_video"]).read_bytes() == b"fake-video"
