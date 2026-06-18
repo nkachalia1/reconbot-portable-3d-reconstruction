@@ -170,8 +170,30 @@ function formatCompact(value: number) {
   }).format(value);
 }
 
+function niceScaleLength(target: number) {
+  if (!Number.isFinite(target) || target <= 0) return 1;
+  const exponent = Math.floor(Math.log10(target));
+  const candidates = [1, 2, 5, 10].map((factor) => factor * 10 ** exponent);
+  return candidates.reduce((best, candidate) =>
+    Math.abs(Math.log(candidate / target)) < Math.abs(Math.log(best / target))
+      ? candidate
+      : best,
+  );
+}
+
+function scaleLengthLabel(length: number, metric: boolean) {
+  if (!metric) {
+    return `${Number(length.toPrecision(2))} SfM units`;
+  }
+  if (length < 0.01) return `${Number((length * 1000).toPrecision(2))} mm`;
+  if (length < 1) return `${Number((length * 100).toPrecision(2))} cm`;
+  return `${Number(length.toPrecision(2))} m`;
+}
+
 function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord }) {
   const mountRef = useRef<HTMLDivElement>(null);
+  const scaleTextRef = useRef<HTMLSpanElement>(null);
+  const scaleLineRef = useRef<HTMLElement>(null);
   const stateRef = useRef<{
     renderer?: THREE.WebGLRenderer;
     scene?: THREE.Scene;
@@ -214,6 +236,7 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
     controls.maxDistance = 2.4;
     controls.maxPolarAngle = Math.PI * 0.49;
     controls.target.set(0, 0.035, 0);
+    controls.autoRotate = autoRotate;
 
     scene.add(new THREE.HemisphereLight("#f3f6ee", "#697166", 2.1));
     const key = new THREE.DirectionalLight("#fff7e2", 2.4);
@@ -230,9 +253,14 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
     scene.add(gridHelper);
 
     const loader = new GLTFLoader();
+    let presentationScale = 1;
+    const homeTarget = new THREE.Vector3(0, 0.035, 0);
+    const homePosition = new THREE.Vector3(0.62, 0.42, 0.68);
     setStatus("Loading reconstruction");
     loader.load(
-      `${reconstruction.model_url}?v=${encodeURIComponent(reconstruction.id)}`,
+      `${reconstruction.model_url}?v=${encodeURIComponent(
+        `${reconstruction.id}-${reconstruction.metrics.mesh_faces ?? "model"}`,
+      )}`,
       (gltf) => {
         const model = gltf.scene;
         model.rotation.x = reconstruction.viewer?.rotation_x ?? 0;
@@ -250,14 +278,25 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
         const center = box.getCenter(new THREE.Vector3());
         const size = box.getSize(new THREE.Vector3());
         const largestDimension = Math.max(size.x, size.y, size.z) || 1;
-        const presentationScale = 0.62 / largestDimension;
+        presentationScale = 0.52 / largestDimension;
         model.scale.setScalar(presentationScale);
         model.position.set(
           -center.x * presentationScale,
           -box.min.y * presentationScale,
           -center.z * presentationScale,
         );
-        controls.target.set(0, size.y * presentationScale * 0.36, 0);
+        const displayedSize = size.multiplyScalar(presentationScale);
+        const radius = Math.max(displayedSize.length() * 0.5, 0.1);
+        homeTarget.set(0, displayedSize.y * 0.48, 0);
+        const direction = homePosition.clone().normalize();
+        const fitDistance =
+          (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov) / 2)) * 1.12;
+        homePosition.copy(homeTarget).addScaledVector(direction, fitDistance);
+        camera.position.copy(homePosition);
+        controls.target.copy(homeTarget);
+        controls.minDistance = Math.max(radius * 0.65, 0.2);
+        controls.maxDistance = Math.max(radius * 5, 2.4);
+        controls.update();
         setStatus("Reconstruction ready");
       },
       undefined,
@@ -265,8 +304,8 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
     );
 
     const reset = () => {
-      camera.position.set(0.62, 0.42, 0.68);
-      controls.target.set(0, 0.035, 0);
+      camera.position.copy(homePosition);
+      controls.target.copy(homeTarget);
       controls.update();
     };
 
@@ -282,6 +321,27 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
 
     const animate = () => {
       controls.update();
+      const viewportHeight = renderer.domElement.clientHeight;
+      if (viewportHeight > 0 && presentationScale > 0) {
+        const distanceToTarget = camera.position.distanceTo(controls.target);
+        const visibleHeight =
+          2 *
+          distanceToTarget *
+          Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+        const modelUnitsPerPixel =
+          visibleHeight / viewportHeight / presentationScale;
+        const length = niceScaleLength(modelUnitsPerPixel * 90);
+        const width = length / modelUnitsPerPixel;
+        if (scaleTextRef.current) {
+          scaleTextRef.current.textContent = scaleLengthLabel(
+            length,
+            Boolean(reconstruction.viewer?.metric),
+          );
+        }
+        if (scaleLineRef.current) {
+          scaleLineRef.current.style.width = `${Math.max(45, Math.min(150, width))}px`;
+        }
+      }
       renderer.render(scene, camera);
       stateRef.current.frame = requestAnimationFrame(animate);
     };
@@ -295,7 +355,13 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
       renderer.dispose();
       renderer.domElement.remove();
     };
-  }, [reconstruction.id, reconstruction.model_url, reconstruction.viewer?.rotation_x]);
+  }, [
+    reconstruction.id,
+    reconstruction.metrics.mesh_faces,
+    reconstruction.model_url,
+    reconstruction.viewer?.metric,
+    reconstruction.viewer?.rotation_x,
+  ]);
 
   useEffect(() => {
     if (stateRef.current.controls) stateRef.current.controls.autoRotate = autoRotate;
@@ -359,9 +425,11 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
         </div>
       </div>
       <div className="viewer-canvas" ref={mountRef} />
-      <div className="viewer-scale">
-        <span>{reconstruction.viewer?.scale_label ?? "Auto-fit"}</span>
-        <i />
+      <div className="viewer-scale" title="Scale at the orbit target depth">
+        <span ref={scaleTextRef}>
+          {reconstruction.viewer?.metric ? "Calculating metric scale" : "Calculating scene scale"}
+        </span>
+        <i ref={scaleLineRef} />
       </div>
       <div className="axis-badge">
         {reconstruction.viewer?.up_axis ?? "Y-up"} ·{" "}

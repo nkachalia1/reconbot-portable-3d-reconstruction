@@ -37,11 +37,20 @@ function writeCatalog(catalog) {
   fs.renameSync(temporary, catalogPath);
 }
 
+function catalogItems(catalog) {
+  return catalog.items ?? catalog.records ?? [];
+}
+
+function replaceCatalogItems(catalog, items) {
+  if (Array.isArray(catalog.records)) catalog.records = items;
+  else catalog.items = items;
+}
+
 function publicCatalog() {
   const catalog = readCatalog();
   return {
     active_id: catalog.active_id,
-    items: catalog.items.map((item) => ({
+    items: catalogItems(catalog).map((item) => ({
       ...item,
       model_url: `/api/reconstructions/${encodeURIComponent(item.id)}/model.glb`,
       video_url: item.asset_files?.video
@@ -67,7 +76,7 @@ function safeIdentifier(value) {
 
 function recordFor(identifier) {
   const catalog = readCatalog();
-  const record = catalog.items.find((item) => item.id === identifier);
+  const record = catalogItems(catalog).find((item) => item.id === identifier);
   return { catalog, record };
 }
 
@@ -146,9 +155,12 @@ function handleApi(request, response, pathname) {
       return true;
     }
     fs.rmSync(target, { recursive: true, force: true });
-    catalog.items = catalog.items.filter((item) => item.id !== identifier);
+    replaceCatalogItems(
+      catalog,
+      catalogItems(catalog).filter((item) => item.id !== identifier),
+    );
     if (catalog.active_id === identifier) {
-      const remaining = [...catalog.items].sort((a, b) =>
+      const remaining = [...catalogItems(catalog)].sort((a, b) =>
         String(b.created_at || "").localeCompare(String(a.created_at || "")),
       );
       catalog.active_id = remaining[0]?.id ?? null;
