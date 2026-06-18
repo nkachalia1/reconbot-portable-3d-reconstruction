@@ -1,0 +1,24 @@
+{
+  "name": "reconbot-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "node scripts/serve.mjs",
+    "verify": "node scripts/verify-dashboard.mjs",
+    "verify:field": "node scripts/verify-field-dashboard.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "lucide-react": "^0.553.0",
+    "playwright-core": "^1.57.0",
+    "pngjs": "^7.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "three": "^0.181.2",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2"
+  }
+}

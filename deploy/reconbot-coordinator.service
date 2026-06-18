@@ -1,0 +1,16 @@
+[Unit]
+Description=ReconBot Raspberry Pi field coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@RECONBOT_USER@
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=/etc/reconbot/coordinator.env
+ExecStart=@PROJECT_DIR@/.venv/bin/python scripts/pi_coordinator.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

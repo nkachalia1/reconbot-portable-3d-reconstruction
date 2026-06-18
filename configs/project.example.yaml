@@ -1,0 +1,13 @@
+project_name: portable_monocular_reconstruction
+camera_id: laptop_webcam
+default_board_cols: 9
+default_board_rows: 6
+default_square_size_m: 0.024
+capture:
+  default_width: 1280
+  default_height: 720
+  default_interval_s: 1.0
+quality:
+  min_blur_laplacian_var: 40.0
+  target_geometric_inlier_ratio: 0.45
+  min_adjacent_matches: 120

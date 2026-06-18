@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portable-recon-robot"
+version = "0.1.0"
+description = "Portable monocular 3D reconstruction pipeline for Raspberry Pi and laptop workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-contrib-python>=4.8",
+]
+
+[project.optional-dependencies]
+viz = [
+    "open3d>=0.18",
+    "matplotlib>=3.8",
+]
+dashboard = [
+    "flask>=3.0",
+    "imageio-ffmpeg>=0.5",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+reconbot = "reconbot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
