@@ -57,6 +57,11 @@ type ReconstructionMetrics = {
   processing_time_s?: number;
   metric_accuracy_percent?: number;
   reference_height_mm?: number;
+  reference_dimension_mm?: number;
+  reference_dimension_label?: string;
+  validation_reference_mm?: number;
+  validation_predicted_mm?: number;
+  scale_m_per_sfm_unit?: number;
   matching_strategy?: string;
   quality_fallback?: boolean;
   wsl_native_staging?: boolean;
@@ -259,7 +264,9 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
     setStatus("Loading reconstruction");
     loader.load(
       `${reconstruction.model_url}?v=${encodeURIComponent(
-        `${reconstruction.id}-${reconstruction.metrics.mesh_faces ?? "model"}`,
+        `${reconstruction.id}-${reconstruction.metrics.mesh_faces ?? "model"}-${
+          reconstruction.metrics.scale_m_per_sfm_unit ?? "native"
+        }`,
       )}`,
       (gltf) => {
         const model = gltf.scene;
@@ -358,6 +365,7 @@ function ModelViewer({ reconstruction }: { reconstruction: ReconstructionRecord 
   }, [
     reconstruction.id,
     reconstruction.metrics.mesh_faces,
+    reconstruction.metrics.scale_m_per_sfm_unit,
     reconstruction.model_url,
     reconstruction.viewer?.metric,
     reconstruction.viewer?.rotation_x,
@@ -461,6 +469,16 @@ function metricValue(value?: number | null, suffix = "") {
       ? value.toFixed(2).replace(/\.?0+$/, "")
       : formatCompact(value);
   return `${formatted}${suffix}`;
+}
+
+function metricReference(metrics: ReconstructionMetrics) {
+  if (metrics.reference_dimension_mm != null) {
+    const label = metrics.reference_dimension_label
+      ? ` ${metrics.reference_dimension_label}`
+      : " reference";
+    return `${metricValue(metrics.reference_dimension_mm, " mm")}${label}`;
+  }
+  return metricValue(metrics.reference_height_mm, " mm");
 }
 
 function ReconstructionLibrary({
@@ -578,9 +596,18 @@ function ReconstructionView({
               <div><dt>Mesh faces</dt><dd>{metricValue(metrics.mesh_faces)}</dd></div>
               <div><dt>Sparse landmarks</dt><dd>{metricValue(metrics.sparse_points)}</dd></div>
               <div>
-                <dt>Reference height</dt>
-                <dd>{metricValue(metrics.reference_height_mm, " mm")}</dd>
+                <dt>Metric reference</dt>
+                <dd>{metricReference(metrics)}</dd>
               </div>
+              {metrics.validation_reference_mm != null ? (
+                <div>
+                  <dt>Validation reference</dt>
+                  <dd>
+                    {metricValue(metrics.validation_predicted_mm, " mm")} predicted /{" "}
+                    {metricValue(metrics.validation_reference_mm, " mm")} measured
+                  </dd>
+                </div>
+              ) : null}
             </dl>
           </div>
 
@@ -636,7 +663,7 @@ function ReconstructionView({
           tone="green"
         />
         <Metric
-          label={metrics.metric_accuracy_percent == null ? "Mean track length" : "Metric accuracy"}
+          label={metrics.metric_accuracy_percent == null ? "Mean track length" : "Scale validation error"}
           value={
             metrics.metric_accuracy_percent == null
               ? metricValue(metrics.mean_track_length)
@@ -645,7 +672,7 @@ function ReconstructionView({
           detail={
             metrics.metric_accuracy_percent == null
               ? "Views observing each sparse point"
-              : "Validation against physical reference"
+              : "Against an independent physical reference"
           }
           tone="amber"
         />
@@ -856,7 +883,7 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
     {
       name: reconstruction.viewer?.metric ? "Metric export" : "GLB export",
       detail: reconstruction.viewer?.metric
-        ? `${metricValue(metrics.reference_height_mm, " mm")} reference / ${reconstruction.viewer?.up_axis ?? "Z-up"}`
+        ? `${metricReference(metrics)} / ${reconstruction.viewer?.up_axis ?? "Z-up"}`
         : `Textured mesh / ${reconstruction.viewer?.up_axis ?? "Y-up"} SfM units`,
       icon: Gauge,
     },
