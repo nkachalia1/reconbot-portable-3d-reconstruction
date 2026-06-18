@@ -2,6 +2,12 @@
 
 A battery-powered Raspberry Pi 5 perception system that captures monocular images, estimates camera motion, reconstructs sparse and dense 3D structure, and reports quantitative reconstruction quality.
 
+## Demo
+
+![Interactive metric 3D reconstruction dashboard](docs/assets/reconstruction-demo.gif)
+
+_Interactive textured reconstruction and quantitative dashboard shown at 2x speed._
+
 This project is intentionally framed as a robotics/computer vision system, not a one-off OpenCV demo. It connects calibration, feature tracking, pose estimation, mapping, deployment constraints, and evaluation.
 
 ## Hardware
