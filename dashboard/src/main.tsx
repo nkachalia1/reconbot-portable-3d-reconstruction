@@ -65,6 +65,13 @@ type ReconstructionMetrics = {
   matching_strategy?: string;
   quality_fallback?: boolean;
   wsl_native_staging?: boolean;
+  reconstruction_backend?: string;
+  neural_engine?: string;
+  neural_method?: string;
+  mesh_watertight?: boolean;
+  mesh_boundary_edges?: number;
+  mesh_non_manifold_edges?: number;
+  fabrication_exports?: boolean;
 };
 
 type ReconstructionRecord = {
@@ -75,6 +82,7 @@ type ReconstructionRecord = {
   source: "field" | "portfolio";
   model_url: string;
   video_url?: string | null;
+  downloads?: Record<string, string>;
   metrics: ReconstructionMetrics;
   viewer?: {
     rotation_x?: number;
@@ -122,6 +130,12 @@ type FieldStatus = {
   reconstruction?: {
     connected?: boolean;
     error?: string;
+    capabilities?: {
+      backends?: string[];
+      gaussian_splat_cli?: boolean;
+      mesh_exports?: boolean;
+      mesh_formats?: string[];
+    };
   };
   pi: {
     temperature_c?: number | null;
@@ -481,6 +495,21 @@ function metricReference(metrics: ReconstructionMetrics) {
   return metricValue(metrics.reference_height_mm, " mm");
 }
 
+function backendLabel(metrics: ReconstructionMetrics) {
+  switch (metrics.reconstruction_backend) {
+    case "nerfacto":
+      return "Nerfacto GPU";
+    case "instant-ngp":
+      return "Instant-NGP GPU";
+    default:
+      return "OpenMVS CPU";
+  }
+}
+
+function backendIsNeural(metrics: ReconstructionMetrics) {
+  return ["nerfacto", "instant-ngp"].includes(metrics.reconstruction_backend ?? "");
+}
+
 function ReconstructionLibrary({
   records,
   activeId,
@@ -638,8 +667,23 @@ function ReconstructionView({
             <dl className="property-list">
               <div><dt>Source duration</dt><dd>{duration(metrics.video_duration_s)}</dd></div>
               <div><dt>Processing time</dt><dd>{duration(metrics.processing_time_s)}</dd></div>
-              <div><dt>Dense backend</dt><dd>OpenMVS CPU</dd></div>
+              <div><dt>Backend</dt><dd>{backendLabel(metrics)}</dd></div>
+              {metrics.mesh_watertight != null ? (
+                <div>
+                  <dt>Topology</dt>
+                  <dd>{metrics.mesh_watertight ? "Watertight" : "Open surface"}</dd>
+                </div>
+              ) : null}
             </dl>
+            {reconstruction.downloads && Object.keys(reconstruction.downloads).length ? (
+              <div className="artifact-downloads">
+                {Object.entries(reconstruction.downloads).map(([kind, url]) => (
+                  <a key={kind} href={url} download>
+                    <Download size={14} /> {kind.replace("mesh_", "").toUpperCase()}
+                  </a>
+                ))}
+              </div>
+            ) : null}
           </div>
         </aside>
       </div>
@@ -843,6 +887,7 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
   const redundant = metrics.redundant_rejected_samples;
   const fullFaces = metrics.full_mesh_faces;
   const publishedFaces = metrics.mesh_faces;
+  const neural = backendIsNeural(metrics);
   const stages = [
     {
       name: "Capture",
@@ -868,8 +913,10 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
       icon: Camera,
     },
     {
-      name: "Dense MVS",
-      detail: `${metricValue(metrics.dense_depth_maps)} depth maps / ${metricValue(metrics.dense_points)} points`,
+      name: neural ? "Neural field" : "Dense MVS",
+      detail: neural
+        ? `${backendLabel(metrics)} / learned scene representation`
+        : `${metricValue(metrics.dense_depth_maps)} depth maps / ${metricValue(metrics.dense_points)} points`,
       icon: Database,
     },
     {
@@ -881,8 +928,14 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
       icon: Triangle,
     },
     {
-      name: reconstruction.viewer?.metric ? "Metric export" : "GLB export",
-      detail: reconstruction.viewer?.metric
+      name: metrics.fabrication_exports
+        ? "Fabrication export"
+        : reconstruction.viewer?.metric
+          ? "Metric export"
+          : "GLB export",
+      detail: metrics.fabrication_exports
+        ? `OBJ / PLY / STL / GLB / ${metrics.mesh_watertight ? "watertight" : "topology report"}`
+        : reconstruction.viewer?.metric
         ? `${metricReference(metrics)} / ${reconstruction.viewer?.up_axis ?? "Z-up"}`
         : `Textured mesh / ${reconstruction.viewer?.up_axis ?? "Y-up"} SfM units`,
       icon: Gauge,
@@ -940,7 +993,11 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
       </section>
 
       <section className="deployment-strip">
-        <div><Cpu size={21} /><strong>Intel i7 CPU</strong><span>Dense MVS fallback</span></div>
+        <div>
+          <Cpu size={21} />
+          <strong>{neural ? "CUDA GPU" : "Intel i7 CPU"}</strong>
+          <span>{neural ? "Neural training" : "Dense MVS processing"}</span>
+        </div>
         <div>
           <Server size={21} />
           <strong>{reconstruction.source === "field" ? "Raspberry Pi 5" : "Laptop webcam"}</strong>
@@ -953,8 +1010,12 @@ function SystemView({ reconstruction }: { reconstruction: ReconstructionRecord |
         </div>
         <div>
           <Box size={21} />
-          <strong>{reconstruction.viewer?.metric ? "Metric GLB" : "Textured GLB"}</strong>
-          <span>{metricValue(metrics.mesh_faces)} published faces</span>
+          <strong>{metrics.fabrication_exports ? "Fabrication bundle" : reconstruction.viewer?.metric ? "Metric GLB" : "Textured GLB"}</strong>
+          <span>
+            {metrics.mesh_watertight != null
+              ? `${metrics.mesh_watertight ? "Watertight" : "Open"} / ${metricValue(metrics.mesh_faces)} faces`
+              : `${metricValue(metrics.mesh_faces)} published faces`}
+          </span>
         </div>
       </section>
     </div>
@@ -992,6 +1053,8 @@ function FieldView({
     `field_${new Date().toISOString().slice(0, 10).replaceAll("-", "")}`,
   );
   const [direction, setDirection] = useState("right");
+  const [backend, setBackend] = useState("openmvs");
+  const [fabricationExports, setFabricationExports] = useState(false);
   const [imageVersion, setImageVersion] = useState(0);
   const [clock, setClock] = useState(Date.now());
   const [job, setJob] = useState<ReconstructionJob | null>(null);
@@ -1094,7 +1157,14 @@ function FieldView({
     setBusy(true);
     setError("");
     try {
-      const response = await fetch("/api/field/reconstruct", { method: "POST" });
+      const response = await fetch("/api/field/reconstruct", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          backend,
+          fabrication_exports: fabricationExports,
+        }),
+      });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Could not start reconstruction");
       const submittedJob = payload.job as ReconstructionJob;
@@ -1124,6 +1194,8 @@ function FieldView({
       !session.latest_video &&
       recoverableFilename?.startsWith(`${session.session_id}_`),
   );
+  const availableBackends = status?.reconstruction?.capabilities?.backends ?? ["openmvs"];
+  const reconstructionBusy = job?.status === "queued" || job?.status === "running";
 
   return (
     <div className="field-layout">
@@ -1289,6 +1361,46 @@ function FieldView({
               </>
             )}
           </div>
+        </div>
+        <div className="reconstruction-options">
+          <label>
+            <span>Reconstruction backend</span>
+            <select
+              value={backend}
+              onChange={(event) => setBackend(event.target.value)}
+              disabled={reconstructionBusy}
+            >
+              <option value="openmvs">OpenMVS CPU</option>
+              <option value="nerfacto" disabled={!availableBackends.includes("nerfacto")}>
+                Nerfacto GPU
+              </option>
+              <option
+                value="instant-ngp"
+                disabled={!availableBackends.includes("instant-ngp")}
+              >
+                Instant-NGP GPU
+              </option>
+            </select>
+          </label>
+          <label
+            className="checkbox-control"
+            title={
+              status?.reconstruction?.capabilities?.mesh_exports
+                ? "Generate repaired OBJ, PLY, STL, and GLB artifacts"
+                : "Start the worker with mesh exports enabled"
+            }
+          >
+            <input
+              type="checkbox"
+              checked={fabricationExports}
+              onChange={(event) => setFabricationExports(event.target.checked)}
+              disabled={
+                reconstructionBusy ||
+                !status?.reconstruction?.capabilities?.mesh_exports
+              }
+            />
+            <span>Watertight exports</span>
+          </label>
         </div>
         {job && (
           <div className={`job-status job-${job.status}`}>

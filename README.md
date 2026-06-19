@@ -46,7 +46,7 @@ Create a virtual environment on the laptop:
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -e .[viz,dashboard,dev]
+.\.venv\Scripts\python -m pip install -e .[viz,mesh,dashboard,dev]
 ```
 
 On a Raspberry Pi, use the lighter install first:
@@ -112,6 +112,22 @@ colmap mapper --database_path outputs/colmap/database.db --image_path data/frame
 
 See [docs/colmap_pipeline.md](docs/colmap_pipeline.md) for the full laptop workflow.
 
+## Neural Reconstruction And Fabrication Exports
+
+The same accepted keyframes and COLMAP poses can now drive Nerfacto,
+Instant-NGP, or Splatfacto through a reproducible Nerfstudio adapter. OpenMVS
+remains the CPU default; GPU options are exposed by the Field tab only when the
+laptop worker is connected to a CUDA-capable Nerfstudio environment.
+
+Triangle-mesh results can be cleaned, hole-filled, manifold-checked, scaled, and
+published as OBJ, PLY, STL, and GLB. Every publication includes a machine-readable
+topology report, and strict fabrication mode fails when a mesh is still open
+instead of claiming it is printable.
+
+See [docs/neural_and_mesh_pipeline.md](docs/neural_and_mesh_pipeline.md) for
+backend selection, CLI examples, deployment flags, scale handling, and the
+cross-backend evaluation matrix.
+
 ## Resume Bullets
 
 - Designed a portable Raspberry Pi perception pipeline for monocular 3D scene reconstruction under battery, compute, storage, and motion blur constraints.
@@ -131,6 +147,7 @@ The React/Three.js dashboard under `dashboard/` provides:
   laptop reconstruction worker.
 - Session 002 versus Session 003 quantitative evaluation.
 - End-to-end system execution trace and deployment constraints.
+- Backend-aware neural/OpenMVS metrics and downloadable fabrication artifacts.
 - Embedded portfolio rotation clip.
 
 Build and run:

@@ -93,6 +93,8 @@ class FakeReconstructionClient:
         assert session_id == "integration"
         assert video_path.read_bytes() == b"fake-video"
         assert parameters["target_faces"] == 300000
+        assert parameters["backend"] == "nerfacto"
+        assert parameters["fabrication_exports"] is True
         return {
             "job": {
                 "id": "job-1",
@@ -188,7 +190,10 @@ def test_coordinator_http_workflow(tmp_path: Path):
     assert video.status_code == 200
     assert video.data == b"fake-video"
 
-    reconstruction = client.post("/api/field/reconstruct")
+    reconstruction = client.post(
+        "/api/field/reconstruct",
+        json={"backend": "nerfacto", "fabrication_exports": True},
+    )
     assert reconstruction.status_code == 202
     assert reconstruction.get_json()["job"]["id"] == "job-1"
 
@@ -203,6 +208,11 @@ def test_coordinator_http_workflow(tmp_path: Path):
     model = client.get("/api/reconstructions/integration/model.glb")
     assert model.status_code == 200
     assert model.data.startswith(b"model.glb")
+
+    mesh = client.get("/api/reconstructions/integration/assets/mesh_stl")
+    assert mesh.status_code == 200
+    assert mesh.data.startswith(b"assets/mesh_stl")
+    assert "model.stl" in mesh.headers["Content-Disposition"]
 
     stopped = client.post("/api/field/session/stop")
     assert stopped.status_code == 200

@@ -114,6 +114,9 @@ def test_worker_api_publishes_completed_job(tmp_path: Path):
         progress("mesh", 80, "Building mesh")
         run = library / identifier
         (run / "model.glb").write_bytes(b"generated-model")
+        (run / "exports").mkdir()
+        (run / "exports" / "model.stl").write_bytes(b"solid generated")
+        (run / "exports" / "mesh_quality.json").write_text("{}", encoding="utf-8")
         record = {
             "id": identifier,
             "title": parameters["title"],
@@ -122,7 +125,12 @@ def test_worker_api_publishes_completed_job(tmp_path: Path):
             "source": "field",
             "metrics": {"registered_images": 42},
             "viewer": {"up_axis": "Y-up"},
-            "asset_files": {"model": "model.glb", "video": "video.mp4"},
+            "asset_files": {
+                "model": "model.glb",
+                "video": "video.mp4",
+                "mesh_stl": "exports/model.stl",
+                "mesh_quality": "exports/mesh_quality.json",
+            },
         }
         return app.extensions["reconbot_catalog"].add(record)
 
@@ -149,8 +157,16 @@ def test_worker_api_publishes_completed_job(tmp_path: Path):
 
     assert job["status"] == "complete"
     assert job["result"]["title"] == "New Run"
+    assert job["result"]["downloads"]["mesh_stl"].endswith("/assets/mesh_stl")
     assert client.get("/api/reconstructions/new_run/model.glb").data == b"generated-model"
     assert client.get("/api/reconstructions/new_run/video.mp4").data == b"recorded-video"
+    mesh = client.get("/api/reconstructions/new_run/assets/mesh_stl")
+    assert mesh.data == b"solid generated"
+    assert "attachment" in mesh.headers["Content-Disposition"]
+
+    health = client.get("/api/health").get_json()
+    assert health["capabilities"]["backends"] == ["openmvs"]
+    assert health["capabilities"]["mesh_exports"] is False
 
 
 def test_failed_job_with_same_video_reuses_checkpoint_directory(tmp_path: Path):

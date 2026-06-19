@@ -127,6 +127,10 @@ class WorkerConfig:
     target_faces: int = 300_000
     keep_work: bool = False
     use_wsl_staging: bool = True
+    enable_neural: bool = False
+    nerfstudio_env: str | None = None
+    neural_max_iterations: int = 10_000
+    enable_mesh_exports: bool = False
 
 
 class ReconstructionCatalog:
@@ -232,6 +236,12 @@ class ReconstructionCatalog:
         payload["video_url"] = (
             f"/api/reconstructions/{identifier}/video.mp4" if files.get("video") else None
         )
+        downloadable = {
+            key: f"/api/reconstructions/{identifier}/assets/{key}"
+            for key in ("mesh_obj", "mesh_ply", "mesh_stl", "mesh_glb", "mesh_quality")
+            if files.get(key)
+        }
+        payload["downloads"] = downloadable
         return payload
 
     def list_public(self) -> dict[str, object]:
@@ -319,10 +329,13 @@ class ReconstructionPipeline:
         command: list[str],
         log_path: Path,
         cwd: Path | None = None,
+        environment_overrides: dict[str, str] | None = None,
     ) -> str:
         environment = os.environ.copy()
         for variable in ("QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR"):
             environment.pop(variable, None)
+        if environment_overrides:
+            environment.update(environment_overrides)
         completed = subprocess.run(
             command,
             cwd=cwd,
@@ -371,6 +384,154 @@ class ReconstructionPipeline:
             ],
             log_path,
         )
+
+    def _run_neural_tool(self, command: list[str], log_path: Path) -> str:
+        """Run a Nerfstudio command directly on Linux or in the configured WSL env."""
+        if os.name != "nt":
+            return self._run(command, log_path, self.config.project_root)
+        converted = [
+            _windows_to_wsl(Path(value)) if re.match(r"^[A-Za-z]:[\\/]", value) else value
+            for value in command
+        ]
+        activation = ""
+        if self.config.nerfstudio_env:
+            environment = self.config.nerfstudio_env.rstrip("/")
+            activation = f"source {shlex.quote(environment + '/bin/activate')} && "
+        shell_command = activation + shlex.join(converted)
+        return self._run_wsl_shell(shell_command, log_path)
+
+    def _run_neural_backend(
+        self,
+        method: str,
+        dense_dir: Path,
+        neural_dir: Path,
+        pipeline_log: Path,
+        progress: Callable[[str, float, str], None],
+    ) -> tuple[Path, dict[str, object]]:
+        """Train and export a Nerfstudio mesh from the existing COLMAP solution."""
+        if not self.config.enable_neural:
+            raise RuntimeError(
+                "Neural reconstruction is disabled on this worker. Start it with "
+                "--enable-neural after configuring a CUDA-capable Nerfstudio WSL environment."
+            )
+        if method not in {"nerfacto", "instant-ngp"}:
+            raise RuntimeError(
+                "Field publication currently supports nerfacto and instant-ngp meshes. "
+                "Use `reconbot neural-reconstruct --method splatfacto` for Gaussian-splat exports."
+            )
+
+        from .neural_reconstruction import build_nerfstudio_plan, write_neural_plan
+
+        plan = build_nerfstudio_plan(
+            dense_dir / "images",
+            dense_dir / "sparse",
+            neural_dir,
+            method=method,
+            max_iterations=self.config.neural_max_iterations,
+        )
+        write_neural_plan(neural_dir / "neural_plan.json", plan)
+        process_stage, train_stage, export_stage = plan.stages
+        if not (plan.data_dir / "transforms.json").exists():
+            progress("neural_prepare", 50, "Importing COLMAP poses into Nerfstudio")
+            self._run_neural_tool(list(process_stage.command), pipeline_log)
+
+        configs = sorted(
+            plan.runs_dir.rglob("config.yml"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not configs:
+            progress("neural_train", 58, f"Training {method} on the accepted keyframes")
+            self._run_neural_tool(list(train_stage.command), pipeline_log)
+            configs = sorted(
+                plan.runs_dir.rglob("config.yml"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        if not configs:
+            raise RuntimeError("Nerfstudio did not write a training config.yml")
+
+        ensure_dir(plan.export_dir)
+        mesh_candidates = sorted(plan.export_dir.rglob("*.ply"))
+        if not mesh_candidates:
+            progress("neural_export", 82, "Extracting a Poisson mesh from the neural field")
+            command = [
+                str(configs[0]) if value == "{config}" else value
+                for value in export_stage.command
+            ]
+            self._run_neural_tool(command, pipeline_log)
+            mesh_candidates = sorted(plan.export_dir.rglob("*.ply"))
+        if not mesh_candidates:
+            raise RuntimeError("Nerfstudio completed without exporting a mesh PLY")
+        mesh = next(
+            (path for path in mesh_candidates if "mesh" in path.stem.lower()),
+            mesh_candidates[0],
+        )
+        return mesh, {
+            "reconstruction_backend": method,
+            "neural_engine": "nerfstudio",
+            "neural_method": method,
+            "neural_export_kind": "poisson-mesh",
+            "neural_config": str(configs[0].relative_to(neural_dir)),
+        }
+
+    def _publish_neural_mesh(
+        self,
+        mesh_path: Path,
+        record_dir: Path,
+        require_watertight: bool,
+        pipeline_log: Path,
+    ) -> tuple[Path, dict[str, object], dict[str, str]]:
+        """Repair a neural mesh inside the Nerfstudio environment and publish exports."""
+        export_dir = ensure_dir(record_dir / "exports")
+        formats = ["ply", "glb"]
+        if require_watertight:
+            formats.extend(["obj", "stl"])
+        command = [
+            "python",
+            "-m",
+            "reconbot.cli",
+            "publish-mesh",
+            "--input",
+            str(mesh_path),
+            "--output-dir",
+            str(export_dir),
+            "--formats",
+            *formats,
+        ]
+        if not require_watertight:
+            command.append("--allow-open")
+        python_path = _windows_to_wsl(self.config.project_root / "src")
+        if os.name == "nt":
+            activation = ""
+            if self.config.nerfstudio_env:
+                environment = self.config.nerfstudio_env.rstrip("/")
+                activation = f"source {shlex.quote(environment + '/bin/activate')} && "
+            converted = [
+                _windows_to_wsl(Path(value)) if re.match(r"^[A-Za-z]:[\\/]", value) else value
+                for value in command
+            ]
+            self._run_wsl_shell(
+                f"{activation}PYTHONPATH={shlex.quote(python_path)} {shlex.join(converted)}",
+                pipeline_log,
+            )
+        else:
+            self._run(
+                command,
+                pipeline_log,
+                self.config.project_root,
+                {"PYTHONPATH": str(self.config.project_root / "src")},
+            )
+        model = export_dir / "model.glb"
+        if not model.exists():
+            raise RuntimeError("Mesh publication did not produce model.glb")
+        quality = json.loads((export_dir / "mesh_quality.json").read_text(encoding="utf-8"))
+        files = {
+            f"mesh_{extension}": f"exports/model.{extension}"
+            for extension in formats
+        }
+        files["mesh_quality"] = "exports/mesh_quality.json"
+        return model, quality, files
 
     def _wsl_home(self) -> str:
         completed = subprocess.run(
@@ -644,6 +805,15 @@ class ReconstructionPipeline:
         state_path = work / "pipeline_state.json"
         started = time.perf_counter()
         video_signature = _file_sha256(video_path)
+        backend = str(parameters.get("backend") or "openmvs").lower()
+        if backend not in {"openmvs", "nerfacto", "instant-ngp"}:
+            raise ValueError("backend must be openmvs, nerfacto, or instant-ngp")
+        fabrication_exports = bool(parameters.get("fabrication_exports", False))
+        if fabrication_exports and not config.enable_mesh_exports:
+            raise RuntimeError(
+                "Fabrication exports are disabled on this worker. Install the mesh extras "
+                "and start the worker with --enable-mesh-exports."
+            )
         profile = {
             "every_n": int(parameters.get("every_n") or config.every_n),
             "min_blur": float(parameters.get("min_blur") or config.min_blur),
@@ -654,6 +824,8 @@ class ReconstructionPipeline:
             "max_gap_s": float(
                 parameters.get("max_gap_s") or config.max_keyframe_gap_s
             ),
+            "backend": backend,
+            "fabrication_exports": fabrication_exports,
         }
         state = self._load_pipeline_state(state_path)
         if state.get("video_sha256") != video_signature or state.get("profile") != profile:
@@ -673,9 +845,13 @@ class ReconstructionPipeline:
             self._save_pipeline_state(state_path, state)
 
         metrics = dict(state.get("metrics") or {})
-        interface_ready = bool(state.get("interface_ready")) and (
-            openmvs_dir / "scene.mvs"
-        ).exists()
+        metrics["reconstruction_backend"] = backend
+        interface_artifact_ready = (
+            (openmvs_dir / "scene.mvs").exists()
+            if backend == "openmvs"
+            else (dense_dir / "images").is_dir() and (dense_dir / "sparse").is_dir()
+        )
+        interface_ready = bool(state.get("interface_ready")) and interface_artifact_ready
         if not interface_ready:
             progress("quality_gate", 8, "Selecting motion-distinct keyframes across the orbit")
             extraction = extract_adaptive_keyframes(
@@ -752,25 +928,88 @@ class ReconstructionPipeline:
             )
             metrics.update(sparse_metrics)
             progress("undistort", 43, "Preparing calibrated images for dense reconstruction")
-            self._run(
-                [
-                    self._openmvs_executable("InterfaceCOLMAP"),
-                    "-i",
-                    str(dense_dir),
-                    "-o",
-                    "scene.mvs",
-                    "--image-folder",
-                    str(dense_dir / "images"),
-                    "--process-priority",
-                    "0",
-                    "--max-threads",
-                    "0",
-                ],
-                pipeline_log,
-                openmvs_dir,
-            )
+            if backend == "openmvs":
+                self._run(
+                    [
+                        self._openmvs_executable("InterfaceCOLMAP"),
+                        "-i",
+                        str(dense_dir),
+                        "-o",
+                        "scene.mvs",
+                        "--image-folder",
+                        str(dense_dir / "images"),
+                        "--process-priority",
+                        "0",
+                        "--max-threads",
+                        "0",
+                    ],
+                    pipeline_log,
+                    openmvs_dir,
+                )
             state.update({"interface_ready": True, "metrics": metrics})
             self._save_pipeline_state(state_path, state)
+
+        if backend != "openmvs":
+            progress("neural_prepare", 48, "Starting the CUDA neural reconstruction backend")
+            neural_dir = ensure_dir(work / "neural")
+            neural_mesh, neural_metrics = self._run_neural_backend(
+                backend,
+                dense_dir,
+                neural_dir,
+                pipeline_log,
+                progress,
+            )
+            metrics.update(neural_metrics)
+            progress("mesh_repair", 92, "Repairing and validating the neural surface")
+            published_model, quality, export_files = self._publish_neural_mesh(
+                neural_mesh,
+                record_dir,
+                fabrication_exports,
+                pipeline_log,
+            )
+            shutil.copy2(published_model, record_dir / "model.glb")
+            after = dict(quality.get("after") or {})
+            metrics.update(
+                {
+                    "mesh_vertices": after.get("vertex_count"),
+                    "mesh_faces": after.get("face_count"),
+                    "mesh_watertight": after.get("watertight"),
+                    "mesh_boundary_edges": after.get("boundary_edges"),
+                    "mesh_non_manifold_edges": after.get("non_manifold_edges"),
+                    "fabrication_exports": fabrication_exports,
+                    "processing_time_s": round(time.perf_counter() - started, 2),
+                    "video_duration_s": parameters.get("duration_s"),
+                    "video_frames": parameters.get("frames"),
+                }
+            )
+            write_json(record_dir / "metrics.json", metrics)
+            shutil.copy2(neural_dir / "neural_plan.json", record_dir / "neural_plan.json")
+            record = {
+                "id": identifier,
+                "title": str(parameters.get("title") or _display_title(identifier)),
+                "created_at": _utc_now(),
+                "status": "complete",
+                "source": "field",
+                "metrics": metrics,
+                "viewer": {
+                    "rotation_x": FIELD_VIEWER_ROTATION_X,
+                    "up_axis": "Y-up",
+                    "scale_label": "Auto-fit",
+                    "metric": False,
+                },
+                "asset_files": {
+                    "model": "model.glb",
+                    "video": "video.mp4",
+                    "metrics": "metrics.json",
+                    "log": "pipeline.log",
+                    "neural_plan": "neural_plan.json",
+                    **export_files,
+                },
+            }
+            public = self.catalog.add(record)
+            if not config.keep_work:
+                shutil.rmtree(work, ignore_errors=True)
+            return public
 
         progress("dense_mvs", 52, "Computing or resuming multi-view depth maps")
         dense_ply = openmvs_dir / "scene_dense.ply"
@@ -886,6 +1125,32 @@ class ReconstructionPipeline:
             config.project_root,
         )
 
+        export_files: dict[str, str] = {}
+        if fabrication_exports:
+            progress("mesh_repair", 98, "Generating watertight fabrication exports")
+            from .mesh_postprocess import postprocess_mesh
+
+            publication = postprocess_mesh(
+                mesh_path,
+                record_dir / "exports",
+                ("obj", "ply", "stl", "glb"),
+                require_watertight=True,
+                normalize_origin=False,
+            )
+            metrics.update(
+                {
+                    "mesh_watertight": publication.after.watertight,
+                    "mesh_boundary_edges": publication.after.boundary_edges,
+                    "mesh_non_manifold_edges": publication.after.non_manifold_edges,
+                    "fabrication_exports": True,
+                }
+            )
+            export_files = {
+                f"mesh_{path.suffix.lstrip('.')}": f"exports/{path.name}"
+                for path in publication.exports
+            }
+            export_files["mesh_quality"] = "exports/mesh_quality.json"
+
         metrics["processing_time_s"] = round(time.perf_counter() - started, 2)
         metrics["video_duration_s"] = parameters.get("duration_s")
         metrics["video_frames"] = parameters.get("frames")
@@ -908,6 +1173,7 @@ class ReconstructionPipeline:
                 "video": "video.mp4",
                 "metrics": "metrics.json",
                 "log": "pipeline.log",
+                **export_files,
             },
         }
         public = self.catalog.add(record)
@@ -1055,7 +1321,21 @@ def create_reconstruction_app(
 
     @app.get("/api/health")
     def health():
-        return jsonify({"ok": True, "role": "reconstruction-worker"})
+        backends = ["openmvs"]
+        if config.enable_neural:
+            backends.extend(["nerfacto", "instant-ngp"])
+        return jsonify(
+            {
+                "ok": True,
+                "role": "reconstruction-worker",
+                "capabilities": {
+                    "backends": backends,
+                    "gaussian_splat_cli": config.enable_neural,
+                    "mesh_exports": config.enable_mesh_exports,
+                    "mesh_formats": ["obj", "ply", "stl", "glb"],
+                },
+            }
+        )
 
     @app.get("/api/reconstructions")
     def reconstructions():
@@ -1092,6 +1372,16 @@ def create_reconstruction_app(
         except (KeyError, FileNotFoundError):
             return jsonify({"error": "Video not found"}), 404
         return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
+
+    @app.get("/api/reconstructions/<identifier>/assets/<kind>")
+    def reconstruction_asset(identifier: str, kind: str):
+        if kind not in {"mesh_obj", "mesh_ply", "mesh_stl", "mesh_glb", "mesh_quality"}:
+            return jsonify({"error": "Asset not found"}), 404
+        try:
+            path = catalog.asset_path(identifier, kind)
+        except (KeyError, FileNotFoundError):
+            return jsonify({"error": "Asset not found"}), 404
+        return send_file(path, as_attachment=True, download_name=path.name, max_age=0)
 
     @app.post("/api/jobs")
     def submit_job():

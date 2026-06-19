@@ -616,6 +616,7 @@ def create_coordinator_app(
 
     @app.post("/api/field/reconstruct")
     def reconstruct_video():
+        body = request.get_json(silent=True) or {}
         if reconstruction_client is None:
             return jsonify({"error": "Reconstruction worker is not configured"}), 503
         if store.current is None or store.current.latest_video is None:
@@ -624,6 +625,9 @@ def create_coordinator_app(
             return jsonify({"error": "Stop the active recording before reconstruction"}), 409
         video_path = store.root / store.current.session_id / store.current.latest_video
         metadata = dict(store.current.video_metadata or {})
+        backend = str(body.get("backend") or "openmvs").lower()
+        if backend not in {"openmvs", "nerfacto", "instant-ngp"}:
+            return jsonify({"error": "Unsupported reconstruction backend"}), 400
         parameters = {
             "title": store.current.session_id.replace("_", " ").title(),
             "duration_s": metadata.get("duration_s"),
@@ -637,6 +641,8 @@ def create_coordinator_app(
             "min_motion_px": 5.0,
             "max_gap_s": 0.75,
             "target_faces": 300000,
+            "backend": backend,
+            "fabrication_exports": bool(body.get("fabrication_exports", False)),
         }
         try:
             payload = reconstruction_client.submit(
@@ -706,6 +712,31 @@ def create_coordinator_app(
             )
         except (URLError, OSError, TimeoutError, ValueError) as exc:
             return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+        return Response(body, status=status_code, headers=headers)
+
+    @app.get("/api/reconstructions/<identifier>/assets/<kind>")
+    def reconstruction_download(identifier: str, kind: str):
+        if reconstruction_client is None:
+            return jsonify({"error": "Reconstruction worker is not configured"}), 503
+        if kind not in {"mesh_obj", "mesh_ply", "mesh_stl", "mesh_glb", "mesh_quality"}:
+            return jsonify({"error": "Asset not found"}), 404
+        try:
+            status_code, body, headers = reconstruction_client.asset(
+                identifier,
+                f"assets/{kind}",
+            )
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            return jsonify({"error": f"Reconstruction worker unavailable: {exc}"}), 503
+        download_names = {
+            "mesh_obj": "model.obj",
+            "mesh_ply": "model.ply",
+            "mesh_stl": "model.stl",
+            "mesh_glb": "model.glb",
+            "mesh_quality": "mesh_quality.json",
+        }
+        headers["Content-Disposition"] = (
+            f'attachment; filename="{download_names[kind]}"'
+        )
         return Response(body, status=status_code, headers=headers)
 
     @app.get("/api/field/latest.jpg")

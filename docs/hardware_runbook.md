@@ -48,7 +48,7 @@ Windows environment; the WSL `.venv` cannot be reused:
 ```powershell
 py -m venv .venv-win
 .\.venv-win\Scripts\python -m pip install --upgrade pip
-.\.venv-win\Scripts\python -m pip install -e ".[dashboard]"
+.\.venv-win\Scripts\python -m pip install -e ".[mesh,dashboard]"
 ```
 
 Set a shared token and start the sensor service:
@@ -62,6 +62,20 @@ $env:RECONBOT_OPENMVS_BIN = "$HOME\Downloads\OpenMVS_Windows_x64\vc17\x64\Releas
 
 This command also starts the reconstruction worker on port `5002`. Add
 `--no-reconstruction-worker` only when intentionally running capture by itself.
+
+Optional neural and fabrication capabilities are advertised to the dashboard
+only when explicitly enabled:
+
+```powershell
+$env:RECONBOT_ENABLE_NEURAL = "1"
+$env:RECONBOT_NERFSTUDIO_ENV = "/home/USER/nerfstudio/.venv"
+$env:RECONBOT_NEURAL_ITERATIONS = "10000"
+$env:RECONBOT_ENABLE_MESH_EXPORTS = "1"
+```
+
+Neural reconstruction requires an NVIDIA CUDA environment. Leave
+`RECONBOT_ENABLE_NEURAL` unset on the current Intel Iris Xe laptop; OpenMVS will
+remain the full-quality CPU backend. Mesh export can be enabled independently.
 
 Confirm locally:
 
@@ -155,7 +169,17 @@ data/reconstruction_library/<session>/video.mp4
 data/reconstruction_library/<session>/model.glb
 data/reconstruction_library/<session>/metrics.json
 data/reconstruction_library/<session>/pipeline.log
+data/reconstruction_library/<session>/exports/model.obj
+data/reconstruction_library/<session>/exports/model.ply
+data/reconstruction_library/<session>/exports/model.stl
+data/reconstruction_library/<session>/exports/model.glb
+data/reconstruction_library/<session>/exports/mesh_quality.json
 ```
+
+The `exports/` bundle is created only when **Watertight exports** is selected.
+Strict publication stops if boundary or non-manifold edges remain. See
+[neural_and_mesh_pipeline.md](neural_and_mesh_pipeline.md) for repair, scale,
+and GPU-backend details.
 
 Successful jobs remove their multi-gigabyte intermediate depth maps to protect
 laptop storage. Failed jobs retain the work directory and pipeline log for

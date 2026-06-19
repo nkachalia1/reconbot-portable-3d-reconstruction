@@ -52,6 +52,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run COLMAP directly on the mounted Windows project instead of WSL storage.",
     )
+    parser.add_argument(
+        "--enable-neural",
+        action="store_true",
+        default=os.environ.get("RECONBOT_ENABLE_NEURAL", "0") == "1",
+        help="Enable CUDA Nerfstudio backends exposed by the worker.",
+    )
+    parser.add_argument(
+        "--nerfstudio-env",
+        default=os.environ.get("RECONBOT_NERFSTUDIO_ENV"),
+        help="Absolute WSL path to the Nerfstudio virtual environment.",
+    )
+    parser.add_argument(
+        "--neural-iterations",
+        type=int,
+        default=int(os.environ.get("RECONBOT_NEURAL_ITERATIONS", "10000")),
+    )
+    parser.add_argument(
+        "--enable-mesh-exports",
+        action="store_true",
+        default=os.environ.get("RECONBOT_ENABLE_MESH_EXPORTS", "0") == "1",
+        help="Enable strict watertight OBJ/PLY/STL/GLB publication.",
+    )
     parser.add_argument("--keep-work", action="store_true")
     return parser
 
@@ -72,6 +94,10 @@ def create_app_from_args(args: argparse.Namespace):
             fallback_max_frames=args.fallback_keyframes,
             use_wsl_staging=not args.no_wsl_staging,
             keep_work=args.keep_work,
+            enable_neural=args.enable_neural,
+            nerfstudio_env=args.nerfstudio_env,
+            neural_max_iterations=args.neural_iterations,
+            enable_mesh_exports=args.enable_mesh_exports,
         )
     )
 

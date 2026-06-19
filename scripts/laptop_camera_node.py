@@ -77,6 +77,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run COLMAP against /mnt/c instead of staging into WSL storage.",
     )
+    parser.add_argument(
+        "--enable-neural",
+        action="store_true",
+        default=os.environ.get("RECONBOT_ENABLE_NEURAL", "0") == "1",
+        help="Enable CUDA Nerfstudio backends in the reconstruction worker.",
+    )
+    parser.add_argument(
+        "--nerfstudio-env",
+        default=os.environ.get("RECONBOT_NERFSTUDIO_ENV"),
+        help="Absolute WSL path to the Nerfstudio virtual environment.",
+    )
+    parser.add_argument(
+        "--neural-iterations",
+        type=int,
+        default=int(os.environ.get("RECONBOT_NEURAL_ITERATIONS", "10000")),
+    )
+    parser.add_argument(
+        "--enable-mesh-exports",
+        action="store_true",
+        default=os.environ.get("RECONBOT_ENABLE_MESH_EXPORTS", "0") == "1",
+        help="Enable watertight OBJ/PLY/STL/GLB publication.",
+    )
     parser.set_defaults(project_root=project_root)
     return parser
 
@@ -104,6 +126,10 @@ def main() -> None:
                 max_frames=args.max_keyframes,
                 fallback_max_frames=args.fallback_keyframes,
                 use_wsl_staging=not args.no_wsl_staging,
+                enable_neural=args.enable_neural,
+                nerfstudio_env=args.nerfstudio_env,
+                neural_max_iterations=args.neural_iterations,
+                enable_mesh_exports=args.enable_mesh_exports,
             )
         )
         thread = threading.Thread(

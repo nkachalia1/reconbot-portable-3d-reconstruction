@@ -89,6 +89,44 @@ def build_parser() -> argparse.ArgumentParser:
     crop.add_argument("--min-xyz", nargs=3, type=float, required=True)
     crop.add_argument("--max-xyz", nargs=3, type=float, required=True)
 
+    neural = sub.add_parser(
+        "neural-reconstruct",
+        help="Plan or run Nerfstudio Nerfacto, Instant-NGP, or Gaussian Splatting.",
+    )
+    neural.add_argument("--images", required=True)
+    neural.add_argument("--colmap-model", required=True)
+    neural.add_argument("--output-dir", required=True)
+    neural.add_argument(
+        "--method",
+        choices=["nerfacto", "instant-ngp", "splatfacto"],
+        default="nerfacto",
+    )
+    neural.add_argument("--max-iterations", type=int, default=10000)
+    neural.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Write reproducible commands without requiring CUDA or Nerfstudio.",
+    )
+
+    publish = sub.add_parser(
+        "publish-mesh",
+        help="Repair, validate, normalize, and export a mesh for printing/CAD/game use.",
+    )
+    publish.add_argument("--input", required=True)
+    publish.add_argument("--output-dir", required=True)
+    publish.add_argument(
+        "--formats",
+        nargs="+",
+        default=["obj", "ply", "stl", "glb"],
+        choices=["obj", "ply", "stl", "glb"],
+    )
+    publish.add_argument("--hole-size", type=float, default=1_000_000.0)
+    publish.add_argument("--no-fill-holes", action="store_true")
+    publish.add_argument("--allow-open", action="store_true")
+    publish.add_argument("--scale-factor", type=float, default=1.0)
+    publish.add_argument("--target-max-dimension-m", type=float)
+    publish.add_argument("--keep-origin", action="store_true")
+
     return parser
 
 
@@ -232,6 +270,56 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote cropped mesh: {args.output}")
             print(f"Vertices: {vertex_count}")
             print(f"Faces: {face_count}")
+            return 0
+
+        if args.command == "neural-reconstruct":
+            from .neural_reconstruction import (
+                build_nerfstudio_plan,
+                run_nerfstudio,
+                write_neural_plan,
+            )
+
+            plan = build_nerfstudio_plan(
+                args.images,
+                args.colmap_model,
+                args.output_dir,
+                args.method,
+                args.max_iterations,
+            )
+            plan_path = write_neural_plan(
+                f"{args.output_dir}/neural_plan.json",
+                plan,
+            )
+            print(f"Wrote neural plan: {plan_path}")
+            if args.plan_only:
+                return 0
+            result = run_nerfstudio(plan, args.output_dir)
+            print(f"Neural method: {result.method}")
+            print(f"Export kind: {result.export_kind}")
+            print(f"Primary artifact: {result.primary_artifact}")
+            print(f"Report: {result.report}")
+            return 0
+
+        if args.command == "publish-mesh":
+            from .mesh_postprocess import postprocess_mesh
+
+            result = postprocess_mesh(
+                args.input,
+                args.output_dir,
+                args.formats,
+                fill_holes=not args.no_fill_holes,
+                hole_size=args.hole_size,
+                require_watertight=not args.allow_open,
+                scale_factor=args.scale_factor,
+                target_max_dimension_m=args.target_max_dimension_m,
+                normalize_origin=not args.keep_origin,
+            )
+            print(f"Watertight: {result.after.watertight}")
+            print(f"Boundary edges: {result.after.boundary_edges}")
+            print(f"Non-manifold edges: {result.after.non_manifold_edges}")
+            for output in result.exports:
+                print(f"Wrote mesh: {output}")
+            print(f"Wrote quality report: {result.report}")
             return 0
 
     except MissingDependencyError as exc:

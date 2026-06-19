@@ -226,6 +226,56 @@ button {
   opacity: 0.6;
 }
 
+.reconstruction-options {
+  display: flex;
+  align-items: end;
+  gap: 18px;
+  padding-top: 12px;
+}
+
+.reconstruction-options > label:not(.checkbox-control) {
+  width: min(260px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reconstruction-options label > span {
+  font-size: 10px;
+  color: #929b95;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.reconstruction-options select {
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid #363c38;
+  border-radius: 4px;
+  background: #0e110f;
+  color: #e5e9e6;
+}
+
+.checkbox-control {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.checkbox-control input {
+  width: 16px;
+  height: 16px;
+  accent-color: #d8e34f;
+}
+
+.checkbox-control:has(input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .command-buttons {
   display: flex;
   gap: 7px;
@@ -679,6 +729,29 @@ p {
 .property-list dd {
   font-size: 12px;
   margin: 0;
+}
+
+.artifact-downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.artifact-downloads a {
+  align-items: center;
+  border: 1px solid var(--line);
+  color: var(--text);
+  display: inline-flex;
+  font-size: 11px;
+  gap: 5px;
+  padding: 6px 8px;
+  text-decoration: none;
+}
+
+.artifact-downloads a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .property-list dd {
@@ -1255,6 +1328,10 @@ p {
     grid-column: 1 / -1;
     flex-wrap: wrap;
   }
+
+  .reconstruction-options {
+    flex-wrap: wrap;
+  }
 }
 
 @media (max-width: 620px) {
@@ -1336,6 +1413,11 @@ p {
 
   .command-buttons {
     grid-column: auto;
+  }
+
+  .reconstruction-options {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .command {

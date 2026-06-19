@@ -50,13 +50,22 @@ function publicCatalog() {
   const catalog = readCatalog();
   return {
     active_id: catalog.active_id,
-    items: catalogItems(catalog).map((item) => ({
-      ...item,
-      model_url: `/api/reconstructions/${encodeURIComponent(item.id)}/model.glb`,
-      video_url: item.asset_files?.video
-        ? `/api/reconstructions/${encodeURIComponent(item.id)}/video.mp4`
-        : null,
-    })),
+    items: catalogItems(catalog).map((item) => {
+      const identifier = encodeURIComponent(item.id);
+      const downloadKinds = ["mesh_obj", "mesh_ply", "mesh_stl", "mesh_glb", "mesh_quality"];
+      return {
+        ...item,
+        model_url: `/api/reconstructions/${identifier}/model.glb`,
+        video_url: item.asset_files?.video
+          ? `/api/reconstructions/${identifier}/video.mp4`
+          : null,
+        downloads: Object.fromEntries(
+          downloadKinds
+            .filter((kind) => item.asset_files?.[kind])
+            .map((kind) => [kind, `/api/reconstructions/${identifier}/assets/${kind}`]),
+        ),
+      };
+    }),
   };
 }
 
@@ -122,6 +131,28 @@ function handleApi(request, response, pathname) {
   }
   if (request.method === "GET" && pathname === "/api/reconstructions") {
     json(response, 200, publicCatalog());
+    return true;
+  }
+
+  const downloadMatch = /^\/api\/reconstructions\/([^/]+)\/assets\/([^/]+)$/.exec(pathname);
+  if (request.method === "GET" && downloadMatch) {
+    const identifier = decodeURIComponent(downloadMatch[1]);
+    const kind = downloadMatch[2];
+    const permitted = new Set(["mesh_obj", "mesh_ply", "mesh_stl", "mesh_glb", "mesh_quality"]);
+    if (!safeIdentifier(identifier) || !permitted.has(kind)) {
+      json(response, 404, { error: "Asset not found" });
+      return true;
+    }
+    const { record } = recordFor(identifier);
+    const filename = record?.asset_files?.[kind];
+    const recordRoot = path.resolve(libraryRoot, identifier);
+    const file = filename ? path.resolve(recordRoot, filename) : null;
+    if (!file || !file.startsWith(`${recordRoot}${path.sep}`) || !fs.existsSync(file)) {
+      json(response, 404, { error: "Asset not found" });
+      return true;
+    }
+    response.setHeader("Content-Disposition", `attachment; filename="${path.basename(file)}"`);
+    streamFile(request, response, file);
     return true;
   }
 

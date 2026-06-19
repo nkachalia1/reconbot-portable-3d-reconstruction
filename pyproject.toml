@@ -18,6 +18,9 @@ viz = [
     "open3d>=0.18",
     "matplotlib>=3.8",
 ]
+mesh = [
+    "open3d>=0.19",
+]
 dashboard = [
     "flask>=3.0",
     "imageio-ffmpeg>=0.5",
